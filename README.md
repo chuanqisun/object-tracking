@@ -1,5 +1,11 @@
 # YOLO26 Real-Time Object Detection
 
+
+https://github.com/user-attachments/assets/0b77b6c8-b7a9-4112-b82e-6873e8463654
+
+
+
+
 A Streamlit web application for real-time object detection and segmentation using YOLOE-26L with text prompts. Detect any object by simply typing what you're looking for.
 
 ## Features
