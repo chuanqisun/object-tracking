@@ -22,7 +22,7 @@ try:
 except Exception:
     pass
 
-from ultralytics import YOLO
+from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 from streamlit_drawable_canvas import st_canvas
 from PIL import Image
@@ -33,39 +33,46 @@ import tempfile
 import av
 from streamlit_webrtc import webrtc_streamer
 
+def parse_classes(text: str) -> list:
+    if not text:
+        return []
+    return [c.strip() for c in text.split(",") if c.strip()]
+
 @st.cache_resource
 def load_model():
-    model = YOLO("yoloe-26s-seg.pt")
+    model = YOLOE("yoloe-26s-seg.pt")
     return model
 
 model = load_model()
 
 class VideoProcessor:
     prompt_mode = "Text Prompt"
-    current_class = ''
+    current_classes = []
     ref_img = None
     visual_prompts = None
 
     @classmethod
-    def update_text_prompt(cls, new_class):
+    def update_text_prompt(cls, new_classes):
         cls.prompt_mode = "Text Prompt"
-        cls.current_class = new_class
-        names = [new_class]
-        model.set_classes(names, model.get_text_pe(names))
+        if isinstance(new_classes, str):
+            cls.current_classes = parse_classes(new_classes)
+        else:
+            cls.current_classes = new_classes
+        if cls.current_classes:
+            model.set_classes(cls.current_classes)
 
     @classmethod
     def update_visual_prompt(cls, ref_img, bboxes, text_label=''):
         cls.prompt_mode = "Visual Prompt"
         cls.ref_img = ref_img
         cls.visual_prompts = {'bboxes': bboxes, 'cls': [0]}
-        cls.current_class = text_label.strip()
-        if cls.current_class:
-            names = [cls.current_class]
-            model.set_classes(names, model.get_text_pe(names))
+        cls.current_classes = parse_classes(text_label)
+        if cls.current_classes:
+            model.set_classes(cls.current_classes)
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        if VideoProcessor.prompt_mode == "Text Prompt" and VideoProcessor.current_class:
+        if VideoProcessor.prompt_mode == "Text Prompt" and VideoProcessor.current_classes:
             results = model.predict(img)
             plotted_img = results[0].plot()
         elif (
@@ -160,10 +167,10 @@ if mode == "Upload Image":
         image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
         if prompt_type == "Text Prompt":
-            word = st.text_input("Enter a class to detect (e.g., person, bus)")
-            if word.strip():
-                names = [word.strip()]
-                model.set_classes(names, model.get_text_pe(names))
+            word = st.text_input("Enter class(es) to detect (comma-separated, e.g., person, bus)")
+            classes = parse_classes(word)
+            if classes:
+                model.set_classes(classes)
                 results = model.predict(image_bgr)
                 plotted_img = results[0].plot()
                 st.image(plotted_img, channels="BGR", use_container_width=True)
@@ -171,9 +178,9 @@ if mode == "Upload Image":
             word = st.text_input("Optional: Enter object name/label for the drawn visual prompt (e.g., mug)")
             bboxes = setup_canvas_drawing(pil_image, key_suffix="img")
             if bboxes and st.button("Detect Similar Objects"):
-                if word.strip():
-                    names = [word.strip()]
-                    model.set_classes(names, model.get_text_pe(names))
+                classes = parse_classes(word)
+                if classes:
+                    model.set_classes(classes)
                 visual_prompts = {'bboxes': bboxes, 'cls': [0]}
                 results = model.predict(
                     image_bgr,
@@ -198,10 +205,10 @@ elif mode == "Upload Video":
             st.error("Failed to open video file")
         else:
             if prompt_type == "Text Prompt":
-                word = st.text_input("Enter a class to detect (e.g., person, bus)")
-                if word.strip() and st.button("Start Processing Video"):
-                    names = [word.strip()]
-                    model.set_classes(names, model.get_text_pe(names))
+                word = st.text_input("Enter class(es) to detect (comma-separated, e.g., person, bus)")
+                classes = parse_classes(word)
+                if classes and st.button("Start Processing Video"):
+                    model.set_classes(classes)
                     frame_placeholder = st.empty()
                     st.write("Processing video...")
                     frame_count = 0
@@ -227,9 +234,9 @@ elif mode == "Upload Video":
                     bboxes = setup_canvas_drawing(pil_ref, key_suffix="vid")
 
                     if bboxes and st.button("Start Processing Video with Visual Prompt"):
-                        if word.strip():
-                            names = [word.strip()]
-                            model.set_classes(names, model.get_text_pe(names))
+                        classes = parse_classes(word)
+                        if classes:
+                            model.set_classes(classes)
                         cap_proc = cv2.VideoCapture(video_path)
                         frame_placeholder = st.empty()
                         st.write("Processing video using Visual Prompt...")
@@ -255,9 +262,10 @@ elif mode == "Upload Video":
 
 elif mode == "Live Camera":
     if prompt_type == "Text Prompt":
-        word = st.text_input("Enter a class to detect (e.g., person, bus)")
-        if word.strip():
-            VideoProcessor.update_text_prompt(word.strip())
+        word = st.text_input("Enter class(es) to detect (comma-separated, e.g., person, bus)")
+        classes = parse_classes(word)
+        if classes:
+            VideoProcessor.update_text_prompt(classes)
             webrtc_streamer(
                 key="yolo-live-text",
                 video_processor_factory=VideoProcessor,
