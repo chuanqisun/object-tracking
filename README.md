@@ -34,6 +34,8 @@ Run the Streamlit app:
 streamlit run app.py # stock yoloe text prompt tracking
 
 streamlit run app-custom.py # custom trained model for speaker tracking
+
+streamlit run app-custom-seg.py # YOLO26 instance segmentation tracking with yolo26s-seg.pt
 ```
 
 ## Extra

@@ -1,2 +1,4 @@
 mobileclip2_b.ts
 *.pt
+
+__pycache__
