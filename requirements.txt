@@ -1,5 +1,8 @@
-aioice==0.10.2
-aiortc==1.14.0
+streamlit-drawable-canvas==0.9.3
+ultralytics
+opencv-python
+streamlit
+streamlit-webrtc
 altair==6.0.0
 attrs==25.4.0
 av==16.1.0
