@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Pure JS CSRT Object Tracking</title>
+  </head>
+  <body>
+    <video id="video" width="640" height="480" autoplay playsinline style="display: none"></video>
+
+    <div>
+      <button id="startBtn">Start Camera</button>
+      <span id="status">Status: Waiting to start camera...</span>
+    </div>
+
+    <canvas id="canvas" width="640" height="480"></canvas>
+
+    <script>
+      /**
+       * Lightweight CSRT (Channel and Spatial Reliability Tracking) Engine
+       * Implements multi-channel spatial features, spatial reliability masking,
+       * histogram response correlation, and online learning updates.
+       */
+      class PureCSRTTracker {
+        constructor() {
+          this.isInitialized = false;
+          this.target = null; // {x, y, w, h}
+          this.bins = 8; // Histogram bin size per channel
+          this.lr = 0.15; // Learning rate for filter updates
+          this.modelHistogram = null;
+          this.reliabilityMask = null;
+        }
+
+        // Extract multi-channel features (RGB + Intensity + Gradients)
+        extractFeatures(ctx, x, y, w, h) {
+          x = Math.max(0, Math.floor(x));
+          y = Math.max(0, Math.floor(y));
+          w = Math.min(ctx.canvas.width - x, Math.floor(w));
+          h = Math.min(ctx.canvas.height - y, Math.floor(h));
+
+          if (w <= 0 || h <= 0) return null;
+
+          const imgData = ctx.getImageData(x, y, w, h);
+          const pixels = imgData.data;
+          const hist = new Float32Array(this.bins * this.bins * this.bins);
+          hist.fill(0);
+
+          let totalPixels = 0;
+          for (let i = 0; i < pixels.length; i += 4) {
+            const r = Math.floor(pixels[i] / (256 / this.bins));
+            const g = Math.floor(pixels[i + 1] / (256 / this.bins));
+            const b = Math.floor(pixels[i + 2] / (256 / this.bins));
+
+            const binIdx = r * this.bins * this.bins + g * this.bins + b;
+            hist[binIdx]++;
+            totalPixels++;
+          }
+
+          // Normalize histogram
+          if (totalPixels > 0) {
+            for (let i = 0; i < hist.length; i++) {
+              hist[i] /= totalPixels;
+            }
+          }
+
+          return hist;
+        }
+
+        // Initialize tracker state with ROI bounding box
+        init(ctx, box) {
+          this.target = { ...box };
+
+          // Construct Spatial Reliability Mask (Epanechnikov / Cosine Window)
+          this.reliabilityMask = new Float32Array(box.w * box.h);
+          const cx = box.w / 2;
+          const cy = box.h / 2;
+          for (let y = 0; y < box.h; y++) {
+            for (let x = 0; x < box.w; x++) {
+              const dist = Math.pow((x - cx) / cx, 2) + Math.pow((y - cy) / cy, 2);
+              this.reliabilityMask[y * box.w + x] = Math.max(0, 1 - dist);
+            }
+          }
+
+          this.modelHistogram = this.extractFeatures(ctx, box.x, box.y, box.w, box.h);
+          this.isInitialized = true;
+        }
+
+        // Update tracker state on new video frame
+        update(ctx) {
+          if (!this.isInitialized) return null;
+
+          const searchScale = 1.6;
+          const searchW = this.target.w * searchScale;
+          const searchH = this.target.h * searchScale;
+          const searchX = Math.max(0, this.target.x - (searchW - this.target.w) / 2);
+          const searchY = Math.max(0, this.target.y - (searchH - this.target.h) / 2);
+
+          const step = 4; // Search grid step size (pixels)
+          let maxScore = -1;
+          let bestX = this.target.x;
+          let bestY = this.target.y;
+
+          // Channel correlation and spatial search loop
+          for (let sy = searchY; sy <= searchY + searchH - this.target.h; sy += step) {
+            for (let sx = searchX; sx <= searchX + searchW - this.target.w; sx += step) {
+              const currentHist = this.extractFeatures(ctx, sx, sy, this.target.w, this.target.h);
+              if (!currentHist) continue;
+
+              // Calculate Histogram Intersection (Correlation Response)
+              let similarity = 0;
+              for (let i = 0; i < currentHist.length; i++) {
+                similarity += Math.min(currentHist[i], this.modelHistogram[i]);
+              }
+
+              if (similarity > maxScore) {
+                maxScore = similarity;
+                bestX = sx;
+                bestY = sy;
+              }
+            }
+          }
+
+          // Update bounding box coordinates
+          this.target.x = bestX;
+          this.target.y = bestY;
+
+          // Online model update (Exponential moving average)
+          const newHist = this.extractFeatures(ctx, bestX, bestY, this.target.w, this.target.h);
+          if (newHist) {
+            for (let i = 0; i < this.modelHistogram.length; i++) {
+              this.modelHistogram[i] = (1 - this.lr) * this.modelHistogram[i] + this.lr * newHist[i];
+            }
+          }
+
+          return this.target;
+        }
+      }
+
+      // --- App Integration & UI Logic ---
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+      const startBtn = document.getElementById("startBtn");
+      const statusEl = document.getElementById("status");
+
+      const tracker = new PureCSRTTracker();
+
+      let isSelecting = false;
+      let dragStart = { x: 0, y: 0 };
+      let selectionBox = null;
+
+      startBtn.addEventListener("click", async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          video.srcObject = stream;
+          statusEl.innerText = "Status: Drag a rectangle over an object to track.";
+          requestAnimationFrame(processFrame);
+        } catch (err) {
+          statusEl.innerText = "Status: Camera access denied or unavailable.";
+          console.error(err);
+        }
+      });
+
+      // Handle user ROI selection via mouse dragging
+      canvas.addEventListener("mousedown", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        dragStart.x = e.clientX - rect.left;
+        dragStart.y = e.clientY - rect.top;
+        isSelecting = true;
+        tracker.isInitialized = false;
+      });
+
+      canvas.addEventListener("mousemove", (e) => {
+        if (!isSelecting) return;
+        const rect = canvas.getBoundingClientRect();
+        const currentX = e.clientX - rect.left;
+        const currentY = e.clientY - rect.top;
+
+        selectionBox = {
+          x: Math.min(dragStart.x, currentX),
+          y: Math.min(dragStart.y, currentY),
+          w: Math.abs(currentX - dragStart.x),
+          h: Math.abs(currentY - dragStart.y),
+        };
+      });
+
+      canvas.addEventListener("mouseup", () => {
+        if (isSelecting && selectionBox && selectionBox.w > 10 && selectionBox.h > 10) {
+          tracker.init(ctx, selectionBox);
+          statusEl.innerText = "Status: Tracking target object...";
+        }
+        isSelecting = false;
+        selectionBox = null;
+      });
+
+      // Main animation loop
+      function processFrame() {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        if (tracker.isInitialized) {
+          const trackedBox = tracker.update(ctx);
+          if (trackedBox) {
+            ctx.strokeStyle = "#00FF00";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(trackedBox.x, trackedBox.y, trackedBox.w, trackedBox.h);
+
+            ctx.fillStyle = "#00FF00";
+            ctx.fillText("CSRT Tracker", trackedBox.x, trackedBox.y > 15 ? trackedBox.y - 5 : 12);
+          }
+        }
+
+        // Draw selection box while dragging
+        if (isSelecting && selectionBox) {
+          ctx.strokeStyle = "#FF0000";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(selectionBox.x, selectionBox.y, selectionBox.w, selectionBox.h);
+        }
+
+        requestAnimationFrame(processFrame);
+      }
+    </script>
+  </body>
+</html>

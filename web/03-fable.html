@@ -1,0 +1,464 @@
+<!doctype html>
+
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CSRT-style Tracker (pure JS)</title>
+  </head>
+  <body>
+    <h1>CSRT-style tracker — pure JavaScript</h1>
+    <input type="file" id="file" accept="video/*" />
+    <button id="webcam">Use webcam</button>
+    <button id="playpause">Play/Pause</button>
+    <span id="status">Load a video, then drag a box around the object.</span>
+    <br />
+    <canvas id="view" width="640" height="480"></canvas>
+    <video id="vid" muted playsinline style="display: none"></video>
+
+    <script>
+      "use strict";
+      /* ============================================================
+   CSRT-style tracker in pure JavaScript.
+   - DCF learned in Fourier domain (custom FFT)
+   - Spatial reliability mask from FG/BG color histograms,
+     applied via projection (simplified ADMM)
+   - Channel reliability weighting
+   - Multi-channel features: gray, grad-x, grad-y, R, G, B
+   - 3-point scale search
+   ============================================================ */
+
+      const N = 64; // filter window size (power of 2)
+      const PADDING = 2.2; // search region = bbox * PADDING
+      const SIGMA_FACTOR = 0.07; // gaussian label width
+      const LAMBDA = 1e-3; // regularization
+      const LEARN_RATE = 0.02; // model update rate
+      const MASK_ITERS = 3; // projection ("ADMM-lite") iterations
+      const SCALES = [0.985, 1.0, 1.015];
+      const SCALE_PENALTY = 0.985;
+      const HIST_BINS = 8; // per color axis
+
+      /* ---------------- FFT ---------------- */
+      function fft1d(re, im, inv) {
+        const n = re.length;
+        for (let i = 1, j = 0; i < n; i++) {
+          // bit reversal
+          let bit = n >> 1;
+          for (; j & bit; bit >>= 1) j ^= bit;
+          j ^= bit;
+          if (i < j) {
+            let t = re[i];
+            re[i] = re[j];
+            re[j] = t;
+            t = im[i];
+            im[i] = im[j];
+            im[j] = t;
+          }
+        }
+        for (let len = 2; len <= n; len <<= 1) {
+          const ang = ((inv ? 2 : -2) * Math.PI) / len;
+          const wr = Math.cos(ang),
+            wi = Math.sin(ang);
+          for (let i = 0; i < n; i += len) {
+            let cwr = 1,
+              cwi = 0;
+            for (let k = 0; k < len / 2; k++) {
+              const a = i + k,
+                b = i + k + len / 2;
+              const tr = re[b] * cwr - im[b] * cwi;
+              const ti = re[b] * cwi + im[b] * cwr;
+              re[b] = re[a] - tr;
+              im[b] = im[a] - ti;
+              re[a] += tr;
+              im[a] += ti;
+              const nwr = cwr * wr - cwi * wi;
+              cwi = cwr * wi + cwi * wr;
+              cwr = nwr;
+            }
+          }
+        }
+        if (inv)
+          for (let i = 0; i < n; i++) {
+            re[i] /= n;
+            im[i] /= n;
+          }
+      }
+
+      function fft2d(re, im, inv) {
+        // in-place N x N
+        const rr = new Float64Array(N),
+          ri = new Float64Array(N);
+        for (let y = 0; y < N; y++) {
+          // rows
+          const o = y * N;
+          for (let x = 0; x < N; x++) {
+            rr[x] = re[o + x];
+            ri[x] = im[o + x];
+          }
+          fft1d(rr, ri, inv);
+          for (let x = 0; x < N; x++) {
+            re[o + x] = rr[x];
+            im[o + x] = ri[x];
+          }
+        }
+        for (let x = 0; x < N; x++) {
+          // cols
+          for (let y = 0; y < N; y++) {
+            rr[y] = re[y * N + x];
+            ri[y] = im[y * N + x];
+          }
+          fft1d(rr, ri, inv);
+          for (let y = 0; y < N; y++) {
+            re[y * N + x] = rr[y];
+            im[y * N + x] = ri[y];
+          }
+        }
+      }
+
+      /* ---------------- precomputed windows/labels ---------------- */
+      const HANN = (() => {
+        const w = new Float64Array(N * N);
+        for (let y = 0; y < N; y++) {
+          const hy = 0.5 * (1 - Math.cos((2 * Math.PI * y) / (N - 1)));
+          for (let x = 0; x < N; x++) w[y * N + x] = hy * 0.5 * (1 - Math.cos((2 * Math.PI * x) / (N - 1)));
+        }
+        return w;
+      })();
+
+      const YF = (() => {
+        // gaussian label, peak at (0,0) wrap-around, in Fourier domain
+        const s = SIGMA_FACTOR * N,
+          re = new Float64Array(N * N),
+          im = new Float64Array(N * N);
+        for (let y = 0; y < N; y++) {
+          const dy = Math.min(y, N - y);
+          for (let x = 0; x < N; x++) {
+            const dx = Math.min(x, N - x);
+            re[y * N + x] = Math.exp(-(dx * dx + dy * dy) / (2 * s * s));
+          }
+        }
+        fft2d(re, im, false);
+        return { re, im };
+      })();
+
+      /* ---------------- feature extraction ---------------- */
+      const work = document.createElement("canvas");
+      work.width = N;
+      work.height = N;
+      const wctx = work.getContext("2d", { willReadFrequently: true });
+
+      // Returns {channels:[Float64Array x6], rgb:Uint8ClampedArray} for the padded box
+      function extractPatch(src, cx, cy, w, h) {
+        const pw = w * PADDING,
+          ph = h * PADDING;
+        wctx.fillStyle = "#000";
+        wctx.fillRect(0, 0, N, N);
+        wctx.drawImage(src, cx - pw / 2, cy - ph / 2, pw, ph, 0, 0, N, N);
+        const data = wctx.getImageData(0, 0, N, N).data;
+
+        const gray = new Float64Array(N * N);
+        const R = new Float64Array(N * N),
+          G = new Float64Array(N * N),
+          B = new Float64Array(N * N);
+        for (let i = 0; i < N * N; i++) {
+          const r = data[i * 4],
+            g = data[i * 4 + 1],
+            b = data[i * 4 + 2];
+          gray[i] = (0.299 * r + 0.587 * g + 0.114 * b) / 255 - 0.5;
+          R[i] = r / 255 - 0.5;
+          G[i] = g / 255 - 0.5;
+          B[i] = b / 255 - 0.5;
+        }
+        const gx = new Float64Array(N * N),
+          gy = new Float64Array(N * N);
+        for (let y = 1; y < N - 1; y++)
+          for (let x = 1; x < N - 1; x++) {
+            const i = y * N + x;
+            gx[i] = gray[i + 1] - gray[i - 1];
+            gy[i] = gray[i + N] - gray[i - N];
+          }
+        const channels = [gray, gx, gy, R, G, B];
+        for (const c of channels) {
+          // hann window
+          let mean = 0;
+          for (let i = 0; i < N * N; i++) mean += c[i];
+          mean /= N * N;
+          for (let i = 0; i < N * N; i++) c[i] = (c[i] - mean) * HANN[i];
+        }
+        return { channels, rgb: data };
+      }
+
+      /* ---------------- spatial reliability mask ---------------- */
+      function colorBin(data, i) {
+        const q = 256 / HIST_BINS;
+        return ((data[i * 4] / q) | 0) * HIST_BINS * HIST_BINS + ((data[i * 4 + 1] / q) | 0) * HIST_BINS + ((data[i * 4 + 2] / q) | 0);
+      }
+
+      // FG = center region of patch (the target bbox inside the padded window), BG = ring outside
+      function buildMask(rgb) {
+        const half = N / (2 * PADDING); // half-size of target inside patch
+        const c = N / 2;
+        const fg = new Float64Array(HIST_BINS ** 3),
+          bg = new Float64Array(HIST_BINS ** 3);
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++) {
+            const i = y * N + x,
+              b = colorBin(rgb, i);
+            if (Math.abs(x - c) < half && Math.abs(y - c) < half) fg[b]++;
+            else bg[b]++;
+          }
+        const mask = new Float64Array(N * N);
+        let count = 0;
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++) {
+            const i = y * N + x,
+              b = colorBin(rgb, i);
+            const p = (fg[b] + 1) / (fg[b] + bg[b] + 2); // FG posterior
+            const inside = Math.abs(x - c) < half * 1.4 && Math.abs(y - c) < half * 1.4;
+            mask[i] = inside && p > 0.5 ? 1 : 0;
+            count += mask[i];
+          }
+        if (count < half * half) {
+          // fallback: default mask
+          mask.fill(0);
+          count = 0;
+          for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (Math.abs(x - c) < half && Math.abs(y - c) < half) mask[y * N + x] = 1;
+        }
+        // one 3x3 dilation pass to smooth the mask
+        const out = new Float64Array(N * N);
+        for (let y = 1; y < N - 1; y++)
+          for (let x = 1; x < N - 1; x++) {
+            const i = y * N + x;
+            out[i] = Math.max(mask[i], mask[i - 1], mask[i + 1], mask[i - N], mask[i + N]);
+          }
+        return out;
+      }
+
+      /* ---------------- the tracker ---------------- */
+      class CSRTracker {
+        constructor(src, x, y, w, h) {
+          this.cx = x + w / 2;
+          this.cy = y + h / 2;
+          this.w = w;
+          this.h = h;
+          const p = extractPatch(src, this.cx, this.cy, w, h);
+          this.mask = buildMask(p.rgb);
+          this.numRe = [];
+          this.numIm = [];
+          this.den = []; // per-channel A, B
+          this.Hre = [];
+          this.Him = []; // constrained filters
+          this.weights = new Float64Array(p.channels.length).fill(1);
+          for (let c = 0; c < p.channels.length; c++) {
+            const fr = Float64Array.from(p.channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const nr = new Float64Array(N * N),
+              ni = new Float64Array(N * N),
+              d = new Float64Array(N * N);
+            for (let i = 0; i < N * N; i++) {
+              // A = Y ⊙ conj(F),  B = F ⊙ conj(F) + λ
+              nr[i] = YF.re[i] * fr[i] + YF.im[i] * fi[i];
+              ni[i] = YF.im[i] * fr[i] - YF.re[i] * fi[i];
+              d[i] = fr[i] * fr[i] + fi[i] * fi[i] + LAMBDA;
+            }
+            this.numRe.push(nr);
+            this.numIm.push(ni);
+            this.den.push(d);
+            this.Hre.push(new Float64Array(N * N));
+            this.Him.push(new Float64Array(N * N));
+          }
+          this.solveFilters();
+          this.updateChannelWeights(p.channels);
+        }
+
+        // H* = A/B, then alternate: spatial-domain mask projection <-> Fourier domain
+        solveFilters() {
+          for (let c = 0; c < this.Hre.length; c++) {
+            const hr = this.Hre[c],
+              hi = this.Him[c];
+            for (let i = 0; i < N * N; i++) {
+              hr[i] = this.numRe[c][i] / this.den[c][i];
+              hi[i] = this.numIm[c][i] / this.den[c][i];
+            }
+            for (let it = 0; it < MASK_ITERS; it++) {
+              fft2d(hr, hi, true); // to spatial domain
+              for (let i = 0; i < N * N; i++) {
+                hr[i] *= this.mask[i];
+                hi[i] = 0;
+              }
+              fft2d(hr, hi, false); // back to Fourier domain
+              if (it < MASK_ITERS - 1)
+                // blend toward unconstrained solution
+                for (let i = 0; i < N * N; i++) {
+                  hr[i] = 0.5 * (hr[i] + this.numRe[c][i] / this.den[c][i]);
+                  hi[i] = 0.5 * (hi[i] + this.numIm[c][i] / this.den[c][i]);
+                }
+            }
+          }
+        }
+
+        responseFor(channels, perChannelPeaks) {
+          const resp = new Float64Array(N * N);
+          for (let c = 0; c < channels.length; c++) {
+            const fr = Float64Array.from(channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const gr = new Float64Array(N * N),
+              gi = new Float64Array(N * N);
+            for (let i = 0; i < N * N; i++) {
+              // G = H* ⊙ F
+              gr[i] = this.Hre[c][i] * fr[i] - this.Him[c][i] * fi[i];
+              gi[i] = this.Hre[c][i] * fi[i] + this.Him[c][i] * fr[i];
+            }
+            fft2d(gr, gi, true);
+            let peak = 0;
+            for (let i = 0; i < N * N; i++) {
+              if (gr[i] > peak) peak = gr[i];
+            }
+            if (perChannelPeaks) perChannelPeaks[c] = Math.max(peak, 1e-8);
+            const w = this.weights[c];
+            for (let i = 0; i < N * N; i++) resp[i] += w * gr[i];
+          }
+          return resp;
+        }
+
+        updateChannelWeights(channels) {
+          const peaks = new Float64Array(channels.length);
+          this.responseFor(channels, peaks);
+          let sum = 0;
+          for (let c = 0; c < peaks.length; c++) sum += peaks[c];
+          for (let c = 0; c < peaks.length; c++) this.weights[c] = 0.6 * this.weights[c] + 0.4 * ((peaks[c] * peaks.length) / sum);
+        }
+
+        track(src) {
+          let best = { score: -Infinity, dx: 0, dy: 0, scale: 1, channels: null, rgb: null };
+          for (const s of SCALES) {
+            const p = extractPatch(src, this.cx, this.cy, this.w * s, this.h * s);
+            const resp = this.responseFor(p.channels, null);
+            let peak = -Infinity,
+              pi = 0;
+            for (let i = 0; i < N * N; i++)
+              if (resp[i] > peak) {
+                peak = resp[i];
+                pi = i;
+              }
+            const score = peak * (s === 1 ? 1 : SCALE_PENALTY);
+            if (score > best.score) {
+              let px = pi % N,
+                py = (pi / N) | 0;
+              if (px > N / 2) px -= N; // wrap-around displacement
+              if (py > N / 2) py -= N;
+              best = { score, scale: s, channels: p.channels, rgb: p.rgb, dx: (px * (this.w * s * PADDING)) / N, dy: (py * (this.h * s * PADDING)) / N };
+            }
+          }
+          this.cx += best.dx;
+          this.cy += best.dy;
+          this.w *= best.scale;
+          this.h *= best.scale;
+
+          // --- model update at new location ---
+          const p = extractPatch(src, this.cx, this.cy, this.w, this.h);
+          const newMask = buildMask(p.rgb);
+          for (let i = 0; i < N * N; i++) this.mask[i] = (1 - LEARN_RATE * 4) * this.mask[i] + LEARN_RATE * 4 * newMask[i] > 0.5 ? 1 : 0;
+          for (let c = 0; c < p.channels.length; c++) {
+            const fr = Float64Array.from(p.channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const nr = this.numRe[c],
+              ni = this.numIm[c],
+              d = this.den[c],
+              L = LEARN_RATE;
+            for (let i = 0; i < N * N; i++) {
+              nr[i] = (1 - L) * nr[i] + L * (YF.re[i] * fr[i] + YF.im[i] * fi[i]);
+              ni[i] = (1 - L) * ni[i] + L * (YF.im[i] * fr[i] - YF.re[i] * fi[i]);
+              d[i] = (1 - L) * d[i] + L * (fr[i] * fr[i] + fi[i] * fi[i] + LAMBDA);
+            }
+          }
+          this.solveFilters();
+          this.updateChannelWeights(p.channels);
+          return { x: this.cx - this.w / 2, y: this.cy - this.h / 2, w: this.w, h: this.h, score: best.score };
+        }
+      }
+
+      /* ---------------- app / UI ---------------- */
+      const vid = document.getElementById("vid");
+      const cvs = document.getElementById("view");
+      const ctx = cvs.getContext("2d");
+      const status = document.getElementById("status");
+      let tracker = null,
+        drag = null;
+
+      document.getElementById("file").onchange = (e) => {
+        const f = e.target.files[0];
+        if (f) {
+          vid.srcObject = null;
+          vid.src = URL.createObjectURL(f);
+          vid.loop = true;
+          vid.play();
+          tracker = null;
+        }
+      };
+      document.getElementById("webcam").onclick = async () => {
+        vid.src = "";
+        vid.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
+        vid.play();
+        tracker = null;
+      };
+      document.getElementById("playpause").onclick = () => (vid.paused ? vid.play() : vid.pause());
+
+      vid.addEventListener("playing", () => {
+        cvs.width = vid.videoWidth || 640;
+        cvs.height = vid.videoHeight || 480;
+      });
+
+      function pos(e) {
+        const r = cvs.getBoundingClientRect();
+        return { x: ((e.clientX - r.left) * cvs.width) / r.width, y: ((e.clientY - r.top) * cvs.height) / r.height };
+      }
+      cvs.onmousedown = (e) => {
+        drag = { a: pos(e), b: pos(e) };
+        tracker = null;
+      };
+      cvs.onmousemove = (e) => {
+        if (drag) drag.b = pos(e);
+      };
+      cvs.onmouseup = (e) => {
+        if (!drag) return;
+        const x = Math.min(drag.a.x, drag.b.x),
+          y = Math.min(drag.a.y, drag.b.y);
+        const w = Math.abs(drag.a.x - drag.b.x),
+          h = Math.abs(drag.a.y - drag.b.y);
+        drag = null;
+        if (w > 10 && h > 10) {
+          tracker = new CSRTracker(cvs, x, y, w, h); // init from current frame
+          status.textContent = "Tracking...";
+        }
+      };
+
+      let lastT = 0;
+      function loop(t) {
+        requestAnimationFrame(loop);
+        if (vid.readyState >= 2) ctx.drawImage(vid, 0, 0, cvs.width, cvs.height);
+        if (tracker && !vid.paused && vid.readyState >= 2) {
+          const box = tracker.track(cvs);
+          ctx.strokeStyle = "lime";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(box.x, box.y, box.w, box.h);
+          const fps = 1000 / Math.max(1, t - lastT);
+          status.textContent = "Tracking | score " + box.score.toFixed(3) + " | " + fps.toFixed(0) + " fps";
+        } else if (tracker) {
+          ctx.strokeStyle = "lime";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(tracker.cx - tracker.w / 2, tracker.cy - tracker.h / 2, tracker.w, tracker.h);
+        }
+        if (drag) {
+          ctx.strokeStyle = "red";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(Math.min(drag.a.x, drag.b.x), Math.min(drag.a.y, drag.b.y), Math.abs(drag.a.x - drag.b.x), Math.abs(drag.a.y - drag.b.y));
+        }
+        lastT = t;
+      }
+      requestAnimationFrame(loop);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1079 @@
+<!doctype html>
+
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CSRT-style Tracker (pure JS) — robust</title>
+  </head>
+  <body>
+    <h1>CSRT-style tracker — pure JavaScript (robust pipeline)</h1>
+    <input type="file" id="file" accept="video/*" />
+    <button id="webcam">Use webcam</button>
+    <button id="playpause">Play/Pause</button>
+    <label><input type="checkbox" id="showfg" /> show FG mask</label>
+    <span id="status">Load a video, then drag a box around the object.</span>
+    <br />
+    <canvas id="view" width="640" height="480"></canvas>
+    <video id="vid" muted playsinline style="display: none"></video>
+
+    <script>
+      "use strict";
+      /* ============================================================
+   CSRT-style tracker in pure JavaScript — robust version.
+   Additions over the base tracker:
+   (2) Failure detection via PSR + Bhattacharyya histogram similarity;
+       model updates are FROZEN when confidence is low (no drift),
+       and a LOST state triggers classical re-detection.
+   (3) Tight bounding-box refinement at init (FG posterior + percentile crop).
+   (4) Background subtraction (per-pixel running Gaussian, exposure
+       compensated) for re-detection — camera is stationary.
+   (5) Preprocessing: global exposure-gain compensation + CLAHE on the
+       luminance channel of every feature patch.
+   (6) Sparse Lucas-Kanade optical flow backup: median-flow consensus
+       sanity-checks / overrides the CSRT displacement.
+   ============================================================ */
+
+      const N = 64; // filter window size (power of 2)
+      const PADDING = 2.2; // search region = bbox * PADDING
+      const SIGMA_FACTOR = 0.07; // gaussian label width
+      const LAMBDA = 1e-3; // regularization
+      const LEARN_RATE = 0.02; // model update rate
+      const MASK_ITERS = 3; // projection ("ADMM-lite") iterations
+      const SCALES = [0.985, 1.0, 1.015];
+      const SCALE_PENALTY = 0.985;
+      const HIST_BINS = 8; // per color axis
+
+      /* ---- robustness thresholds ---- */
+      const PSR_UPDATE = 5.5; // learn model only above this
+      const SIM_UPDATE = 0.5; // ...and above this hist similarity
+      const PSR_LOST = 3.2; // below this counts toward "lost"
+      const SIM_LOST = 0.3;
+      const LOST_FRAMES = 5; // consecutive bad frames -> LOST
+      const REDETECT_SIM = 0.45; // min hist similarity to accept a blob
+      const FLOW_DISAGREE = 0.6; // fraction of box size
+
+      const DS = 4; // downscale factor for BG model / optical flow
+
+      /* ---------------- FFT ---------------- */
+      function fft1d(re, im, inv) {
+        const n = re.length;
+        for (let i = 1, j = 0; i < n; i++) {
+          let bit = n >> 1;
+          for (; j & bit; bit >>= 1) j ^= bit;
+          j ^= bit;
+          if (i < j) {
+            let t = re[i];
+            re[i] = re[j];
+            re[j] = t;
+            t = im[i];
+            im[i] = im[j];
+            im[j] = t;
+          }
+        }
+        for (let len = 2; len <= n; len <<= 1) {
+          const ang = ((inv ? 2 : -2) * Math.PI) / len;
+          const wr = Math.cos(ang),
+            wi = Math.sin(ang);
+          for (let i = 0; i < n; i += len) {
+            let cwr = 1,
+              cwi = 0;
+            for (let k = 0; k < len / 2; k++) {
+              const a = i + k,
+                b = i + k + len / 2;
+              const tr = re[b] * cwr - im[b] * cwi;
+              const ti = re[b] * cwi + im[b] * cwr;
+              re[b] = re[a] - tr;
+              im[b] = im[a] - ti;
+              re[a] += tr;
+              im[a] += ti;
+              const nwr = cwr * wr - cwi * wi;
+              cwi = cwr * wi + cwi * wr;
+              cwr = nwr;
+            }
+          }
+        }
+        if (inv)
+          for (let i = 0; i < n; i++) {
+            re[i] /= n;
+            im[i] /= n;
+          }
+      }
+
+      function fft2d(re, im, inv) {
+        const rr = new Float64Array(N),
+          ri = new Float64Array(N);
+        for (let y = 0; y < N; y++) {
+          const o = y * N;
+          for (let x = 0; x < N; x++) {
+            rr[x] = re[o + x];
+            ri[x] = im[o + x];
+          }
+          fft1d(rr, ri, inv);
+          for (let x = 0; x < N; x++) {
+            re[o + x] = rr[x];
+            im[o + x] = ri[x];
+          }
+        }
+        for (let x = 0; x < N; x++) {
+          for (let y = 0; y < N; y++) {
+            rr[y] = re[y * N + x];
+            ri[y] = im[y * N + x];
+          }
+          fft1d(rr, ri, inv);
+          for (let y = 0; y < N; y++) {
+            re[y * N + x] = rr[y];
+            im[y * N + x] = ri[y];
+          }
+        }
+      }
+
+      /* ---------------- precomputed windows/labels ---------------- */
+      const HANN = (() => {
+        const w = new Float64Array(N * N);
+        for (let y = 0; y < N; y++) {
+          const hy = 0.5 * (1 - Math.cos((2 * Math.PI * y) / (N - 1)));
+          for (let x = 0; x < N; x++) w[y * N + x] = hy * 0.5 * (1 - Math.cos((2 * Math.PI * x) / (N - 1)));
+        }
+        return w;
+      })();
+
+      const YF = (() => {
+        const s = SIGMA_FACTOR * N,
+          re = new Float64Array(N * N),
+          im = new Float64Array(N * N);
+        for (let y = 0; y < N; y++) {
+          const dy = Math.min(y, N - y);
+          for (let x = 0; x < N; x++) {
+            const dx = Math.min(x, N - x);
+            re[y * N + x] = Math.exp(-(dx * dx + dy * dy) / (2 * s * s));
+          }
+        }
+        fft2d(re, im, false);
+        return { re, im };
+      })();
+
+      /* ================= (5) preprocessing: exposure gain + CLAHE ================= */
+      let expGain = 1; // global exposure compensation gain
+      let refLum = null; // reference luminance captured at tracker init
+
+      // CLAHE on an N x N array of 0..255 values, 4x4 tiles, 64 bins
+      function claheEq(g) {
+        const T = 4,
+          ts = N / T,
+          nb = 64,
+          area = ts * ts;
+        const clip = Math.max(2, (area / nb) * 3);
+        const maps = [];
+        for (let ty = 0; ty < T; ty++)
+          for (let tx = 0; tx < T; tx++) {
+            const hist = new Float64Array(nb);
+            for (let y = ty * ts; y < (ty + 1) * ts; y++)
+              for (let x = tx * ts; x < (tx + 1) * ts; x++) {
+                let b = (g[y * N + x] / 4) | 0;
+                if (b > nb - 1) b = nb - 1;
+                if (b < 0) b = 0;
+                hist[b]++;
+              }
+            // clip & redistribute
+            let excess = 0;
+            for (let b = 0; b < nb; b++)
+              if (hist[b] > clip) {
+                excess += hist[b] - clip;
+                hist[b] = clip;
+              }
+            const add = excess / nb;
+            for (let b = 0; b < nb; b++) hist[b] += add;
+            // cdf -> mapping
+            const map = new Float64Array(nb);
+            let c = 0;
+            for (let b = 0; b < nb; b++) {
+              c += hist[b];
+              map[b] = (c / area) * 255;
+            }
+            maps.push(map);
+          }
+        const out = new Float64Array(N * N);
+        for (let y = 0; y < N; y++) {
+          let tyf = (y + 0.5) / ts - 0.5;
+          let ty0 = Math.floor(tyf);
+          const fy = tyf - ty0;
+          const ty1 = Math.min(T - 1, Math.max(0, ty0 + 1));
+          ty0 = Math.min(T - 1, Math.max(0, ty0));
+          for (let x = 0; x < N; x++) {
+            let txf = (x + 0.5) / ts - 0.5;
+            let tx0 = Math.floor(txf);
+            const fx = txf - tx0;
+            const tx1 = Math.min(T - 1, Math.max(0, tx0 + 1));
+            tx0 = Math.min(T - 1, Math.max(0, tx0));
+            let b = (g[y * N + x] / 4) | 0;
+            if (b > nb - 1) b = nb - 1;
+            if (b < 0) b = 0;
+            const v00 = maps[ty0 * T + tx0][b],
+              v01 = maps[ty0 * T + tx1][b];
+            const v10 = maps[ty1 * T + tx0][b],
+              v11 = maps[ty1 * T + tx1][b];
+            out[y * N + x] = (1 - fy) * ((1 - fx) * v00 + fx * v01) + fy * ((1 - fx) * v10 + fx * v11);
+          }
+        }
+        return out;
+      }
+
+      /* ---------------- feature extraction ---------------- */
+      const work = document.createElement("canvas");
+      work.width = N;
+      work.height = N;
+      const wctx = work.getContext("2d", { willReadFrequently: true });
+
+      function extractPatch(src, cx, cy, w, h) {
+        const pw = w * PADDING,
+          ph = h * PADDING;
+        wctx.fillStyle = "#000";
+        wctx.fillRect(0, 0, N, N);
+        wctx.drawImage(src, cx - pw / 2, cy - ph / 2, pw, ph, 0, 0, N, N);
+        const raw = wctx.getImageData(0, 0, N, N).data;
+
+        // exposure-compensated copy (also used for color histograms / mask)
+        const data = new Uint8ClampedArray(raw.length);
+        const gain = expGain;
+        const g255 = new Float64Array(N * N);
+        for (let i = 0; i < N * N; i++) {
+          const r = Math.min(255, raw[i * 4] * gain);
+          const g = Math.min(255, raw[i * 4 + 1] * gain);
+          const b = Math.min(255, raw[i * 4 + 2] * gain);
+          data[i * 4] = r;
+          data[i * 4 + 1] = g;
+          data[i * 4 + 2] = b;
+          data[i * 4 + 3] = 255;
+          g255[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        }
+        // CLAHE on luminance (robust to exposure/contrast drift)
+        const eq = claheEq(g255);
+
+        const gray = new Float64Array(N * N);
+        const R = new Float64Array(N * N),
+          G = new Float64Array(N * N),
+          B = new Float64Array(N * N);
+        for (let i = 0; i < N * N; i++) {
+          gray[i] = eq[i] / 255 - 0.5;
+          R[i] = data[i * 4] / 255 - 0.5;
+          G[i] = data[i * 4 + 1] / 255 - 0.5;
+          B[i] = data[i * 4 + 2] / 255 - 0.5;
+        }
+        const gx = new Float64Array(N * N),
+          gy = new Float64Array(N * N);
+        for (let y = 1; y < N - 1; y++)
+          for (let x = 1; x < N - 1; x++) {
+            const i = y * N + x;
+            gx[i] = gray[i + 1] - gray[i - 1];
+            gy[i] = gray[i + N] - gray[i - N];
+          }
+        const channels = [gray, gx, gy, R, G, B];
+        for (const c of channels) {
+          let mean = 0;
+          for (let i = 0; i < N * N; i++) mean += c[i];
+          mean /= N * N;
+          for (let i = 0; i < N * N; i++) c[i] = (c[i] - mean) * HANN[i];
+        }
+        return { channels, rgb: data };
+      }
+
+      /* ---------------- spatial reliability mask ---------------- */
+      function colorBin(data, i) {
+        const q = 256 / HIST_BINS;
+        return ((data[i * 4] / q) | 0) * HIST_BINS * HIST_BINS + ((data[i * 4 + 1] / q) | 0) * HIST_BINS + ((data[i * 4 + 2] / q) | 0);
+      }
+
+      function fgPosterior(rgb) {
+        const half = N / (2 * PADDING),
+          c = N / 2;
+        const fg = new Float64Array(HIST_BINS ** 3),
+          bg = new Float64Array(HIST_BINS ** 3);
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++) {
+            const i = y * N + x,
+              b = colorBin(rgb, i);
+            if (Math.abs(x - c) < half && Math.abs(y - c) < half) fg[b]++;
+            else bg[b]++;
+          }
+        return (i) => {
+          const b = colorBin(rgb, i);
+          return (fg[b] + 1) / (fg[b] + bg[b] + 2);
+        };
+      }
+
+      function buildMask(rgb) {
+        const half = N / (2 * PADDING),
+          c = N / 2;
+        const post = fgPosterior(rgb);
+        const mask = new Float64Array(N * N);
+        let count = 0;
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++) {
+            const i = y * N + x;
+            const inside = Math.abs(x - c) < half * 1.4 && Math.abs(y - c) < half * 1.4;
+            mask[i] = inside && post(i) > 0.5 ? 1 : 0;
+            count += mask[i];
+          }
+        if (count < half * half) {
+          mask.fill(0);
+          for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (Math.abs(x - c) < half && Math.abs(y - c) < half) mask[y * N + x] = 1;
+        }
+        const out = new Float64Array(N * N);
+        for (let y = 1; y < N - 1; y++)
+          for (let x = 1; x < N - 1; x++) {
+            const i = y * N + x;
+            out[i] = Math.max(mask[i], mask[i - 1], mask[i + 1], mask[i - N], mask[i + N]);
+          }
+        return out;
+      }
+
+      /* ================= (3) tight bounding-box refinement at init ================= */
+      function refineInitBox(src, x, y, w, h) {
+        const cx = x + w / 2,
+          cy = y + h / 2;
+        const p = extractPatch(src, cx, cy, w, h);
+        const post = fgPosterior(p.rgb);
+        const half = N / (2 * PADDING),
+          c = N / 2;
+        const xs = [],
+          ys = [];
+        for (let py = 0; py < N; py++)
+          for (let px = 0; px < N; px++) {
+            if (Math.abs(px - c) < half * 1.3 && Math.abs(py - c) < half * 1.3 && post(py * N + px) > 0.55) {
+              xs.push(px);
+              ys.push(py);
+            }
+          }
+        if (xs.length < half * half * 0.15) return { x, y, w, h }; // not enough FG evidence
+        xs.sort((a, b) => a - b);
+        ys.sort((a, b) => a - b);
+        const q = (arr, f) => arr[Math.min(arr.length - 1, Math.max(0, Math.round(f * (arr.length - 1))))];
+        const x0 = q(xs, 0.03),
+          x1 = q(xs, 0.97),
+          y0 = q(ys, 0.03),
+          y1 = q(ys, 0.97);
+        const sx = (w * PADDING) / N,
+          sy = (h * PADDING) / N;
+        let nw = (x1 - x0 + 2) * sx,
+          nh = (y1 - y0 + 2) * sy;
+        let ncx = cx + ((x0 + x1) / 2 - c) * sx,
+          ncy = cy + ((y0 + y1) / 2 - c) * sy;
+        // don't shrink/grow crazily
+        nw = Math.min(w * 1.05, Math.max(w * 0.45, nw));
+        nh = Math.min(h * 1.05, Math.max(h * 0.45, nh));
+        return { x: ncx - nw / 2, y: ncy - nh / 2, w: nw, h: nh };
+      }
+
+      /* ================= (2) color histogram template + Bhattacharyya ================= */
+      const hcvs = document.createElement("canvas");
+      hcvs.width = 24;
+      hcvs.height = 24;
+      const hctx = hcvs.getContext("2d", { willReadFrequently: true });
+
+      function regionHist(src, cx, cy, w, h) {
+        hctx.fillStyle = "#000";
+        hctx.fillRect(0, 0, 24, 24);
+        hctx.drawImage(src, cx - w / 2, cy - h / 2, w, h, 0, 0, 24, 24);
+        const d = hctx.getImageData(0, 0, 24, 24).data;
+        const hist = new Float64Array(HIST_BINS ** 3);
+        const q = 256 / HIST_BINS,
+          gain = expGain;
+        let total = 0;
+        for (let i = 0; i < 24 * 24; i++) {
+          const r = Math.min(255, d[i * 4] * gain),
+            g = Math.min(255, d[i * 4 + 1] * gain),
+            b = Math.min(255, d[i * 4 + 2] * gain);
+          hist[((r / q) | 0) * HIST_BINS * HIST_BINS + ((g / q) | 0) * HIST_BINS + ((b / q) | 0)]++;
+          total++;
+        }
+        for (let i = 0; i < hist.length; i++) hist[i] /= total;
+        return hist;
+      }
+
+      function bhattacharyya(p, q) {
+        let s = 0;
+        for (let i = 0; i < p.length; i++) s += Math.sqrt(p[i] * q[i]);
+        return s; // 1 = identical, 0 = disjoint
+      }
+
+      /* ================= (2) PSR (peak-to-sidelobe ratio) ================= */
+      function computePSR(resp, pi) {
+        const peak = resp[pi],
+          px = pi % N,
+          py = (pi / N) | 0;
+        let sum = 0,
+          sum2 = 0,
+          n = 0;
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++) {
+            let dx = Math.abs(x - px);
+            dx = Math.min(dx, N - dx);
+            let dy = Math.abs(y - py);
+            dy = Math.min(dy, N - dy);
+            if (dx <= 5 && dy <= 5) continue; // exclude peak neighborhood
+            const v = resp[y * N + x];
+            sum += v;
+            sum2 += v * v;
+            n++;
+          }
+        const mean = sum / n;
+        const sd = Math.sqrt(Math.max(1e-12, sum2 / n - mean * mean));
+        return (peak - mean) / sd;
+      }
+
+      /* ================= (4) background subtraction (static camera) ================= */
+      class BGModel {
+        constructor(w, h) {
+          this.w = w;
+          this.h = h;
+          this.mean = new Float32Array(w * h);
+          this.varr = new Float32Array(w * h).fill(200);
+          this.fg = new Uint8Array(w * h);
+          this.ready = false;
+          this.frames = 0;
+        }
+        // gray: Float32Array of downscaled luminance (raw), gain compensates exposure
+        update(gray, gain, protect) {
+          const { w, h, mean, varr, fg } = this;
+          if (!this.ready) {
+            for (let i = 0; i < w * h; i++) mean[i] = gray[i] * gain;
+            this.ready = true;
+            return;
+          }
+          this.frames++;
+          for (let y = 0; y < h; y++)
+            for (let x = 0; x < w; x++) {
+              const i = y * w + x;
+              const v = gray[i] * gain;
+              const d = v - mean[i];
+              const isFg = d * d > Math.max(20 * 20, 6.25 * varr[i]) ? 1 : 0; // 2.5 sigma
+              fg[i] = isFg;
+              const inProtect = protect && x >= protect.x && x < protect.x + protect.w && y >= protect.y && y < protect.y + protect.h;
+              // learn background slowly; almost freeze inside FG / tracked region
+              const a = isFg || inProtect ? 0.002 : 0.03;
+              mean[i] += a * d;
+              varr[i] = (1 - a) * varr[i] + a * d * d;
+              if (varr[i] < 20) varr[i] = 20;
+              if (varr[i] > 3000) varr[i] = 3000;
+            }
+          // morphological opening (erode then dilate) to kill speckle
+          const tmp = new Uint8Array(w * h);
+          for (let y = 1; y < h - 1; y++)
+            for (let x = 1; x < w - 1; x++) {
+              const i = y * w + x;
+              tmp[i] = fg[i] & fg[i - 1] & fg[i + 1] & fg[i - w] & fg[i + w];
+            }
+          for (let y = 1; y < h - 1; y++)
+            for (let x = 1; x < w - 1; x++) {
+              const i = y * w + x;
+              fg[i] = tmp[i] | tmp[i - 1] | tmp[i + 1] | tmp[i - w] | tmp[i + w];
+            }
+        }
+        blobs(minArea) {
+          const { w, h, fg } = this;
+          const lab = new Int32Array(w * h);
+          const out = [];
+          const stack = [];
+          let id = 0;
+          for (let s = 0; s < w * h; s++) {
+            if (!fg[s] || lab[s]) continue;
+            id++;
+            let area = 0,
+              minx = w,
+              maxx = 0,
+              miny = h,
+              maxy = 0,
+              sx = 0,
+              sy = 0;
+            stack.length = 0;
+            stack.push(s);
+            lab[s] = id;
+            while (stack.length) {
+              const i = stack.pop();
+              const x = i % w,
+                y = (i / w) | 0;
+              area++;
+              sx += x;
+              sy += y;
+              if (x < minx) minx = x;
+              if (x > maxx) maxx = x;
+              if (y < miny) miny = y;
+              if (y > maxy) maxy = y;
+              if (x > 0 && fg[i - 1] && !lab[i - 1]) {
+                lab[i - 1] = id;
+                stack.push(i - 1);
+              }
+              if (x < w - 1 && fg[i + 1] && !lab[i + 1]) {
+                lab[i + 1] = id;
+                stack.push(i + 1);
+              }
+              if (y > 0 && fg[i - w] && !lab[i - w]) {
+                lab[i - w] = id;
+                stack.push(i - w);
+              }
+              if (y < h - 1 && fg[i + w] && !lab[i + w]) {
+                lab[i + w] = id;
+                stack.push(i + w);
+              }
+            }
+            if (area >= minArea) out.push({ area, cx: sx / area, cy: sy / area, x: minx, y: miny, w: maxx - minx + 1, h: maxy - miny + 1 });
+          }
+          return out;
+        }
+      }
+
+      /* ================= (6) sparse Lucas-Kanade optical flow ================= */
+      class LKFlow {
+        constructor(w, h) {
+          this.w = w;
+          this.h = h;
+          this.prev = null;
+        }
+        setPrev(gray) {
+          this.prev = Float32Array.from(gray);
+        }
+        bilin(g, x, y) {
+          const { w, h } = this;
+          if (x < 0) x = 0;
+          if (y < 0) y = 0;
+          if (x > w - 1.001) x = w - 1.001;
+          if (y > h - 1.001) y = h - 1.001;
+          const x0 = x | 0,
+            y0 = y | 0,
+            fx = x - x0,
+            fy = y - y0;
+          const i = y0 * w + x0;
+          return (1 - fy) * ((1 - fx) * g[i] + fx * g[i + 1]) + fy * ((1 - fx) * g[i + w] + fx * g[i + w + 1]);
+        }
+        // box in small-frame coords; returns {dx,dy,n} in small-frame pixels or null
+        estimate(cur, box) {
+          if (!this.prev) return null;
+          const { w, h, prev } = this;
+          const r = 4; // 9x9 window
+          const pts = [];
+          const gx0 = Math.max(r + 1, box.x + box.w * 0.15),
+            gx1 = Math.min(w - r - 2, box.x + box.w * 0.85);
+          const gy0 = Math.max(r + 1, box.y + box.h * 0.15),
+            gy1 = Math.min(h - r - 2, box.y + box.h * 0.85);
+          const stepX = Math.max(2, (gx1 - gx0) / 5),
+            stepY = Math.max(2, (gy1 - gy0) / 5);
+          for (let py = gy0; py <= gy1; py += stepY) for (let px = gx0; px <= gx1; px += stepX) pts.push({ x: px, y: py });
+          const dxs = [],
+            dys = [];
+          for (const p of pts) {
+            // structure tensor on prev
+            let Ixx = 0,
+              Iyy = 0,
+              Ixy = 0;
+            const Ix = [],
+              Iy = [],
+              Iv = [];
+            for (let oy = -r; oy <= r; oy++)
+              for (let ox = -r; ox <= r; ox++) {
+                const x = p.x + ox,
+                  y = p.y + oy;
+                const ix = (this.bilin(prev, x + 1, y) - this.bilin(prev, x - 1, y)) * 0.5;
+                const iy = (this.bilin(prev, x, y + 1) - this.bilin(prev, x, y - 1)) * 0.5;
+                Ix.push(ix);
+                Iy.push(iy);
+                Iv.push(this.bilin(prev, x, y));
+                Ixx += ix * ix;
+                Iyy += iy * iy;
+                Ixy += ix * iy;
+              }
+            const det = Ixx * Iyy - Ixy * Ixy;
+            const tr = Ixx + Iyy;
+            const minEig = (tr - Math.sqrt(Math.max(0, tr * tr - 4 * det))) / 2;
+            if (minEig < 30) continue; // not a trackable corner
+            // iterative LK
+            let vx = 0,
+              vy = 0,
+              ok = true;
+            for (let it = 0; it < 10; it++) {
+              let bx = 0,
+                by = 0,
+                k = 0;
+              for (let oy = -r; oy <= r; oy++)
+                for (let ox = -r; ox <= r; ox++, k++) {
+                  const it2 = this.bilin(cur, p.x + ox + vx, p.y + oy + vy) - Iv[k];
+                  bx += it2 * Ix[k];
+                  by += it2 * Iy[k];
+                }
+              const ddx = -(Iyy * bx - Ixy * by) / det;
+              const ddy = -(Ixx * by - Ixy * bx) / det;
+              vx += ddx;
+              vy += ddy;
+              if (Math.abs(ddx) < 0.03 && Math.abs(ddy) < 0.03) break;
+              if (Math.abs(vx) > 12 || Math.abs(vy) > 12) {
+                ok = false;
+                break;
+              }
+            }
+            if (!ok) continue;
+            // residual check
+            let res = 0,
+              k = 0;
+            for (let oy = -r; oy <= r; oy += 2)
+              for (let ox = -r; ox <= r; ox += 2, k++) {
+                const d = this.bilin(cur, p.x + ox + vx, p.y + oy + vy) - this.bilin(prev, p.x + ox, p.y + oy);
+                res += d * d;
+              }
+            if (res / k > 500) continue;
+            dxs.push(vx);
+            dys.push(vy);
+          }
+          if (dxs.length < 4) return null;
+          dxs.sort((a, b) => a - b);
+          dys.sort((a, b) => a - b);
+          const med = (a) => a[(a.length / 2) | 0];
+          return { dx: med(dxs), dy: med(dys), n: dxs.length };
+        }
+      }
+
+      /* ---------------- the tracker ---------------- */
+      class CSRTracker {
+        constructor(src, x, y, w, h) {
+          this.cx = x + w / 2;
+          this.cy = y + h / 2;
+          this.w = w;
+          this.h = h;
+          const p = extractPatch(src, this.cx, this.cy, w, h);
+          this.mask = buildMask(p.rgb);
+          this.numRe = [];
+          this.numIm = [];
+          this.den = [];
+          this.Hre = [];
+          this.Him = [];
+          this.weights = new Float64Array(p.channels.length).fill(1);
+          for (let c = 0; c < p.channels.length; c++) {
+            const fr = Float64Array.from(p.channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const nr = new Float64Array(N * N),
+              ni = new Float64Array(N * N),
+              d = new Float64Array(N * N);
+            for (let i = 0; i < N * N; i++) {
+              nr[i] = YF.re[i] * fr[i] + YF.im[i] * fi[i];
+              ni[i] = YF.im[i] * fr[i] - YF.re[i] * fi[i];
+              d[i] = fr[i] * fr[i] + fi[i] * fi[i] + LAMBDA;
+            }
+            this.numRe.push(nr);
+            this.numIm.push(ni);
+            this.den.push(d);
+            this.Hre.push(new Float64Array(N * N));
+            this.Him.push(new Float64Array(N * N));
+          }
+          this.solveFilters();
+          this.updateChannelWeights(p.channels);
+        }
+
+        solveFilters() {
+          for (let c = 0; c < this.Hre.length; c++) {
+            const hr = this.Hre[c],
+              hi = this.Him[c];
+            for (let i = 0; i < N * N; i++) {
+              hr[i] = this.numRe[c][i] / this.den[c][i];
+              hi[i] = this.numIm[c][i] / this.den[c][i];
+            }
+            for (let it = 0; it < MASK_ITERS; it++) {
+              fft2d(hr, hi, true);
+              for (let i = 0; i < N * N; i++) {
+                hr[i] *= this.mask[i];
+                hi[i] = 0;
+              }
+              fft2d(hr, hi, false);
+              if (it < MASK_ITERS - 1)
+                for (let i = 0; i < N * N; i++) {
+                  hr[i] = 0.5 * (hr[i] + this.numRe[c][i] / this.den[c][i]);
+                  hi[i] = 0.5 * (hi[i] + this.numIm[c][i] / this.den[c][i]);
+                }
+            }
+          }
+        }
+
+        responseFor(channels, perChannelPeaks) {
+          const resp = new Float64Array(N * N);
+          for (let c = 0; c < channels.length; c++) {
+            const fr = Float64Array.from(channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const gr = new Float64Array(N * N),
+              gi = new Float64Array(N * N);
+            for (let i = 0; i < N * N; i++) {
+              gr[i] = this.Hre[c][i] * fr[i] - this.Him[c][i] * fi[i];
+              gi[i] = this.Hre[c][i] * fi[i] + this.Him[c][i] * fr[i];
+            }
+            fft2d(gr, gi, true);
+            let peak = 0;
+            for (let i = 0; i < N * N; i++) if (gr[i] > peak) peak = gr[i];
+            if (perChannelPeaks) perChannelPeaks[c] = Math.max(peak, 1e-8);
+            const w = this.weights[c];
+            for (let i = 0; i < N * N; i++) resp[i] += w * gr[i];
+          }
+          return resp;
+        }
+
+        updateChannelWeights(channels) {
+          const peaks = new Float64Array(channels.length);
+          this.responseFor(channels, peaks);
+          let sum = 0;
+          for (let c = 0; c < peaks.length; c++) sum += peaks[c];
+          for (let c = 0; c < peaks.length; c++) this.weights[c] = 0.6 * this.weights[c] + 0.4 * ((peaks[c] * peaks.length) / sum);
+        }
+
+        // Localization only — does NOT commit position or update the model.
+        locate(src) {
+          let best = { score: -Infinity, dx: 0, dy: 0, scale: 1, resp: null, pi: 0 };
+          for (const s of SCALES) {
+            const p = extractPatch(src, this.cx, this.cy, this.w * s, this.h * s);
+            const resp = this.responseFor(p.channels, null);
+            let peak = -Infinity,
+              pi = 0;
+            for (let i = 0; i < N * N; i++)
+              if (resp[i] > peak) {
+                peak = resp[i];
+                pi = i;
+              }
+            const score = peak * (s === 1 ? 1 : SCALE_PENALTY);
+            if (score > best.score) {
+              let px = pi % N,
+                py = (pi / N) | 0;
+              if (px > N / 2) px -= N;
+              if (py > N / 2) py -= N;
+              best = { score, scale: s, resp, pi, dx: (px * (this.w * s * PADDING)) / N, dy: (py * (this.h * s * PADDING)) / N };
+            }
+          }
+          const psr = computePSR(best.resp, best.pi);
+          return {
+            cx: this.cx + best.dx,
+            cy: this.cy + best.dy,
+            w: this.w * best.scale,
+            h: this.h * best.scale,
+            score: best.score,
+            psr,
+          };
+        }
+
+        commit(cx, cy, w, h, maxW, maxH) {
+          this.cx = Math.min(maxW, Math.max(0, cx));
+          this.cy = Math.min(maxH, Math.max(0, cy));
+          this.w = w;
+          this.h = h;
+        }
+
+        // Model update — only called when the tracker is confident (drift prevention).
+        update(src) {
+          const p = extractPatch(src, this.cx, this.cy, this.w, this.h);
+          const newMask = buildMask(p.rgb);
+          for (let i = 0; i < N * N; i++) this.mask[i] = (1 - LEARN_RATE * 4) * this.mask[i] + LEARN_RATE * 4 * newMask[i] > 0.5 ? 1 : 0;
+          for (let c = 0; c < p.channels.length; c++) {
+            const fr = Float64Array.from(p.channels[c]),
+              fi = new Float64Array(N * N);
+            fft2d(fr, fi, false);
+            const nr = this.numRe[c],
+              ni = this.numIm[c],
+              d = this.den[c],
+              L = LEARN_RATE;
+            for (let i = 0; i < N * N; i++) {
+              nr[i] = (1 - L) * nr[i] + L * (YF.re[i] * fr[i] + YF.im[i] * fi[i]);
+              ni[i] = (1 - L) * ni[i] + L * (YF.im[i] * fr[i] - YF.re[i] * fi[i]);
+              d[i] = (1 - L) * d[i] + L * (fr[i] * fr[i] + fi[i] * fi[i] + LAMBDA);
+            }
+          }
+          this.solveFilters();
+          this.updateChannelWeights(p.channels);
+        }
+      }
+
+      /* ---------------- app / UI ---------------- */
+      const vid = document.getElementById("vid");
+      const cvs = document.getElementById("view");
+      const ctx = cvs.getContext("2d");
+      const status = document.getElementById("status");
+      const showfg = document.getElementById("showfg");
+      let tracker = null,
+        drag = null;
+
+      /* pipeline state */
+      let state = "IDLE"; // IDLE | TRACKING | UNCERTAIN | LOST
+      let lostCount = 0;
+      let templateHist = null; // color histogram of the target at init (never adapted)
+      let initW = 0,
+        initH = 0;
+      let lastBox = null;
+
+      /* downscaled frame infrastructure (BG model + flow + exposure) */
+      const scvs = document.createElement("canvas");
+      const sctx = scvs.getContext("2d", { willReadFrequently: true });
+      let SW = 160,
+        SH = 120;
+      let bg = null,
+        flow = null;
+
+      function setupSmall() {
+        SW = Math.max(32, (cvs.width / DS) | 0);
+        SH = Math.max(24, (cvs.height / DS) | 0);
+        scvs.width = SW;
+        scvs.height = SH;
+        bg = new BGModel(SW, SH);
+        flow = new LKFlow(SW, SH);
+      }
+      setupSmall();
+
+      function grabSmallGray() {
+        sctx.drawImage(vid, 0, 0, SW, SH);
+        const d = sctx.getImageData(0, 0, SW, SH).data;
+        const g = new Float32Array(SW * SH);
+        let sum = 0;
+        for (let i = 0; i < SW * SH; i++) {
+          const v = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+          g[i] = v;
+          sum += v;
+        }
+        return { gray: g, meanLum: sum / (SW * SH) };
+      }
+
+      function updateExposure(meanLum) {
+        if (refLum === null) {
+          expGain = 1;
+          return;
+        }
+        expGain = Math.min(2.2, Math.max(0.5, refLum / Math.max(1, meanLum)));
+      }
+
+      /* ================= (2)+(4) re-detection via BG blobs + histogram match ================= */
+      function tryRedetect() {
+        if (!bg || !bg.ready || !templateHist) return false;
+        const targetAreaSmall = (initW / DS) * (initH / DS);
+        const blobs = bg.blobs(Math.max(4, targetAreaSmall * 0.15));
+        let best = null;
+        for (const b of blobs) {
+          const areaRatio = b.area / Math.max(1, targetAreaSmall);
+          if (areaRatio < 0.15 || areaRatio > 5) continue; // wrong size
+          const cx = b.cx * DS,
+            cy = b.cy * DS;
+          const hist = regionHist(cvs, cx, cy, initW, initH);
+          const sim = bhattacharyya(hist, templateHist);
+          if (sim > REDETECT_SIM && (!best || sim > best.sim)) best = { cx, cy, sim };
+        }
+        if (best) {
+          // re-initialize CSRT at the recovered location, keep original size
+          tracker = new CSRTracker(cvs, best.cx - initW / 2, best.cy - initH / 2, initW, initH);
+          state = "UNCERTAIN";
+          lostCount = 0;
+          return true;
+        }
+        return false;
+      }
+
+      document.getElementById("file").onchange = (e) => {
+        const f = e.target.files[0];
+        if (f) {
+          vid.srcObject = null;
+          vid.src = URL.createObjectURL(f);
+          vid.loop = true;
+          vid.play();
+          tracker = null;
+          state = "IDLE";
+          refLum = null;
+          templateHist = null;
+        }
+      };
+      document.getElementById("webcam").onclick = async () => {
+        vid.src = "";
+        vid.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
+        vid.play();
+        tracker = null;
+        state = "IDLE";
+        refLum = null;
+        templateHist = null;
+      };
+      document.getElementById("playpause").onclick = () => (vid.paused ? vid.play() : vid.pause());
+
+      vid.addEventListener("playing", () => {
+        cvs.width = vid.videoWidth || 640;
+        cvs.height = vid.videoHeight || 480;
+        setupSmall();
+      });
+
+      function pos(e) {
+        const r = cvs.getBoundingClientRect();
+        return { x: ((e.clientX - r.left) * cvs.width) / r.width, y: ((e.clientY - r.top) * cvs.height) / r.height };
+      }
+      cvs.onmousedown = (e) => {
+        drag = { a: pos(e), b: pos(e) };
+        tracker = null;
+        state = "IDLE";
+      };
+      cvs.onmousemove = (e) => {
+        if (drag) drag.b = pos(e);
+      };
+      cvs.onmouseup = (e) => {
+        if (!drag) return;
+        let x = Math.min(drag.a.x, drag.b.x),
+          y = Math.min(drag.a.y, drag.b.y);
+        let w = Math.abs(drag.a.x - drag.b.x),
+          h = Math.abs(drag.a.y - drag.b.y);
+        drag = null;
+        if (w > 10 && h > 10) {
+          // lock exposure reference to current lighting
+          const { meanLum } = grabSmallGray();
+          refLum = meanLum;
+          expGain = 1;
+          // (3) tighten the user's box before init
+          const r = refineInitBox(cvs, x, y, w, h);
+          x = r.x;
+          y = r.y;
+          w = r.w;
+          h = r.h;
+          tracker = new CSRTracker(cvs, x, y, w, h);
+          initW = w;
+          initH = h;
+          templateHist = regionHist(cvs, x + w / 2, y + h / 2, w, h);
+          state = "TRACKING";
+          lostCount = 0;
+          status.textContent = "Tracking...";
+        }
+      };
+
+      function drawBox(b, color, dashed) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.setLineDash(dashed ? [8, 6] : []);
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.setLineDash([]);
+      }
+
+      function drawFgOverlay() {
+        if (!bg || !bg.ready) return;
+        const img = ctx.getImageData(0, 0, cvs.width, cvs.height);
+        for (let y = 0; y < cvs.height; y++) {
+          const sy = Math.min(SH - 1, (y / DS) | 0);
+          for (let x = 0; x < cvs.width; x++) {
+            if (bg.fg[sy * SW + Math.min(SW - 1, (x / DS) | 0)]) {
+              const i = (y * cvs.width + x) * 4;
+              img.data[i] = Math.min(255, img.data[i] + 120);
+            }
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+
+      let lastT = 0,
+        lastVidTime = -1;
+      function loop(t) {
+        requestAnimationFrame(loop);
+        if (vid.readyState >= 2) ctx.drawImage(vid, 0, 0, cvs.width, cvs.height);
+
+        const newFrame = vid.readyState >= 2 && !vid.paused && vid.currentTime !== lastVidTime;
+        if (newFrame) {
+          lastVidTime = vid.currentTime;
+          const { gray, meanLum } = grabSmallGray();
+          updateExposure(meanLum); // (5) exposure gain compensation
+
+          // (4) update background model (skip learning inside tracked box)
+          let protect = null;
+          if (tracker && state !== "LOST")
+            protect = {
+              x: (tracker.cx - tracker.w * 0.7) / DS,
+              y: (tracker.cy - tracker.h * 0.7) / DS,
+              w: (tracker.w * 1.4) / DS,
+              h: (tracker.h * 1.4) / DS,
+            };
+          bg.update(gray, expGain, protect);
+
+          if (tracker && state === "LOST") {
+            tryRedetect(); // (2)+(4) classical re-detection
+          } else if (tracker) {
+            // (6) optical flow estimate from the previous frame's box
+            const smallBox = {
+              x: (tracker.cx - tracker.w / 2) / DS,
+              y: (tracker.cy - tracker.h / 2) / DS,
+              w: tracker.w / DS,
+              h: tracker.h / DS,
+            };
+            const fl = flow.estimate(gray, smallBox);
+
+            // CSRT localization
+            const res = tracker.locate(cvs);
+            let cx = res.cx,
+              cy = res.cy,
+              w = res.w,
+              h = res.h;
+
+            // (6) flow consensus sanity check: if CSRT disagrees with the
+            // median optical flow while its own confidence is weak, trust flow.
+            if (fl && res.psr < PSR_UPDATE) {
+              const fdx = fl.dx * DS,
+                fdy = fl.dy * DS;
+              const ddx = cx - tracker.cx - fdx,
+                ddy = cy - tracker.cy - fdy;
+              const tol = Math.max(12, FLOW_DISAGREE * Math.max(tracker.w, tracker.h));
+              if (Math.hypot(ddx, ddy) > tol) {
+                cx = tracker.cx + fdx;
+                cy = tracker.cy + fdy;
+                w = tracker.w;
+                h = tracker.h; // don't trust CSRT scale either
+              }
+            }
+            tracker.commit(cx, cy, w, h, cvs.width, cvs.height);
+
+            // (2) appearance verification against the FIXED init template
+            const sim = bhattacharyya(regionHist(cvs, tracker.cx, tracker.cy, tracker.w, tracker.h), templateHist);
+
+            if (res.psr >= PSR_UPDATE && sim >= SIM_UPDATE) {
+              tracker.update(cvs); // learn only when confident -> no drift
+              state = "TRACKING";
+              lostCount = 0;
+            } else if (res.psr < PSR_LOST || sim < SIM_LOST) {
+              state = "UNCERTAIN";
+              lostCount++;
+              if (lostCount >= LOST_FRAMES) state = "LOST"; // freeze + start re-detection
+            } else {
+              state = "UNCERTAIN"; // hold position, freeze model
+              lostCount = Math.max(0, lostCount - 1);
+            }
+
+            lastBox = {
+              x: tracker.cx - tracker.w / 2,
+              y: tracker.cy - tracker.h / 2,
+              w: tracker.w,
+              h: tracker.h,
+              psr: res.psr,
+              sim,
+              score: res.score,
+            };
+          }
+          flow.setPrev(gray);
+        }
+
+        /* ---- drawing / HUD ---- */
+        if (showfg.checked) drawFgOverlay();
+        if (tracker && lastBox) {
+          const color = state === "TRACKING" ? "lime" : state === "UNCERTAIN" ? "orange" : "red";
+          drawBox(lastBox, color, state === "LOST");
+          const fps = 1000 / Math.max(1, t - lastT);
+          status.textContent =
+            state +
+            " | PSR " +
+            (lastBox.psr !== undefined ? lastBox.psr.toFixed(1) : "-") +
+            " | hist " +
+            (lastBox.sim !== undefined ? lastBox.sim.toFixed(2) : "-") +
+            " | gain " +
+            expGain.toFixed(2) +
+            " | " +
+            fps.toFixed(0) +
+            " fps" +
+            (state === "LOST" ? " — re-detecting via BG subtraction..." : "");
+        }
+        if (drag) {
+          ctx.strokeStyle = "red";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(Math.min(drag.a.x, drag.b.x), Math.min(drag.a.y, drag.b.y), Math.abs(drag.a.x - drag.b.x), Math.abs(drag.a.y - drag.b.y));
+        }
+        lastT = t;
+      }
+      requestAnimationFrame(loop);
+    </script>
+  </body>
+</html>
