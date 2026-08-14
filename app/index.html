@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Real-Time YOLO Segmentation (WebGPU / WASM)</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.all.min.js"></script>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 20px;
+      }
+      .controls {
+        margin-bottom: 12px;
+      }
+      label {
+        font-weight: bold;
+      }
+      #canvasContainer {
+        position: relative;
+        display: inline-block;
+      }
+      canvas {
+        border: 1px solid #333;
+        max-width: 100%;
+        height: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>YOLO Segmentation Real-Time Webcam (WebGPU / WASM)</h2>
+
+    <div class="controls">
+      <label>1. Load ONNX Model: </label>
+      <input type="file" id="modelFile" accept=".onnx" />
+    </div>
+
+    <div class="controls">
+      <label>2. Select Camera: </label>
+      <select id="cameraSelect" disabled>
+        <option value="">-- Choose Camera --</option>
+      </select>
+      <button id="toggleStreamBtn" disabled>Start Camera</button>
+    </div>
+
+    <div class="controls">
+      <label>Confidence Threshold: </label>
+      <input type="range" id="confThres" min="0.1" max="0.9" step="0.05" value="0.35" />
+      <span id="confVal">0.35</span>
+      &nbsp;&nbsp;
+      <label>IoU Threshold (NMS): </label>
+      <input type="range" id="iouThres" min="0.1" max="0.9" step="0.05" value="0.45" />
+      <span id="iouVal">0.45</span>
+    </div>
+
+    <div id="status" style="margin-bottom: 12px; font-weight: bold; color: #0066cc">Please load your ONNX model to begin.</div>
+
+    <!-- Hidden video element serving as media stream receiver -->
+    <video id="webcamVideo" playsinline muted style="display: none"></video>
+
+    <!-- Main Output Canvas -->
+    <div id="canvasContainer">
+      <canvas id="outputCanvas" width="640" height="640"></canvas>
+    </div>
+
+    <script>
+      // Configure remote WASM dependencies
+      ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
+      ort.env.wasm.simd = true;
+
+      let session = null;
+      let isStreaming = false;
+      let isProcessing = false;
+      let currentStream = null;
+      let animFrameId = null;
+
+      // DOM Elements
+      const modelFileInput = document.getElementById("modelFile");
+      const cameraSelect = document.getElementById("cameraSelect");
+      const toggleStreamBtn = document.getElementById("toggleStreamBtn");
+      const video = document.getElementById("webcamVideo");
+      const canvas = document.getElementById("outputCanvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: false });
+      const statusDiv = document.getElementById("status");
+      const confThresInput = document.getElementById("confThres");
+      const iouThresInput = document.getElementById("iouThres");
+      const confValLabel = document.getElementById("confVal");
+      const iouValLabel = document.getElementById("iouVal");
+
+      // Shared Preallocated Buffers to avoid GC jitter
+      const offscreenCanvas = document.createElement("canvas");
+      offscreenCanvas.width = 640;
+      offscreenCanvas.height = 640;
+      const offscreenCtx = offscreenCanvas.getContext("2d", { willReadFrequently: true });
+      const inputFloat32Buffer = new Float32Array(3 * 640 * 640);
+
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = 160;
+      maskCanvas.height = 160;
+      const maskCtx = maskCanvas.getContext("2d");
+
+      confThresInput.addEventListener("input", (e) => (confValLabel.innerText = e.target.value));
+      iouThresInput.addEventListener("input", (e) => (iouValLabel.innerText = e.target.value));
+
+      // Device Enumeration
+      async function populateCameraList() {
+        cameraSelect.innerHTML = "";
+        try {
+          // Trigger initial permission check to get labeled devices
+          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          tempStream.getTracks().forEach((t) => t.stop());
+
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoDevices = devices.filter((d) => d.kind === "videoinput");
+
+          videoDevices.forEach((device, index) => {
+            const opt = document.createElement("option");
+            opt.value = device.deviceId;
+            opt.text = device.label || `Camera ${index + 1}`;
+            cameraSelect.appendChild(opt);
+          });
+
+          if (videoDevices.length > 0) {
+            cameraSelect.disabled = false;
+            toggleStreamBtn.disabled = false;
+          }
+        } catch (err) {
+          statusDiv.innerText = `Camera access error: ${err.message}`;
+        }
+      }
+
+      // 3-Tier Fallback Session Initializer
+      async function createInferenceSession(modelBuffer) {
+        if (navigator.gpu) {
+          try {
+            statusDiv.innerText = "Attempting WebGPU...";
+            const sess = await ort.InferenceSession.create(modelBuffer, {
+              executionProviders: ["webgpu"],
+              graphOptimizationLevel: "all",
+            });
+            return { session: sess, backend: "WebGPU" };
+          } catch (err) {
+            console.warn("WebGPU initialization failed:", err);
+          }
+        }
+
+        if (self.crossOriginIsolated) {
+          try {
+            statusDiv.innerText = "Attempting Multi-threaded WASM SIMD...";
+            ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+            const sess = await ort.InferenceSession.create(modelBuffer, {
+              executionProviders: ["wasm"],
+              graphOptimizationLevel: "all",
+            });
+            return { session: sess, backend: `WASM Multi-thread (${ort.env.wasm.numThreads}T)` };
+          } catch (err) {
+            console.warn("Multi-threaded WASM failed:", err);
+          }
+        }
+
+        statusDiv.innerText = "Falling back to Single-threaded WASM...";
+        ort.env.wasm.numThreads = 1;
+        const sess = await ort.InferenceSession.create(modelBuffer, {
+          executionProviders: ["wasm"],
+          graphOptimizationLevel: "all",
+        });
+        return { session: sess, backend: "WASM Single-thread" };
+      }
+
+      // Model Loading
+      modelFileInput.addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        statusDiv.innerText = "Loading ONNX model into memory...";
+        const buffer = await file.arrayBuffer();
+
+        try {
+          const { session: sess, backend } = await createInferenceSession(buffer);
+          session = sess;
+          statusDiv.innerText = `Model ready! Backend: [${backend}]. Select camera to start.`;
+          await populateCameraList();
+        } catch (err) {
+          console.error(err);
+          statusDiv.innerText = `Failed to load model: ${err.message}`;
+        }
+      });
+
+      // Camera Stream Controls
+      async function startStream(deviceId) {
+        if (currentStream) {
+          currentStream.getTracks().forEach((t) => t.stop());
+        }
+
+        const constraints = {
+          video: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            width: { ideal: 640 },
+            height: { ideal: 640 },
+          },
+          audio: false,
+        };
+
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = currentStream;
+        await video.play();
+
+        isStreaming = true;
+        toggleStreamBtn.innerText = "Stop Camera";
+        requestAnimationFrame(renderLoop);
+      }
+
+      function stopStream() {
+        isStreaming = false;
+        if (animFrameId) cancelAnimationFrame(animFrameId);
+        if (currentStream) {
+          currentStream.getTracks().forEach((t) => t.stop());
+          currentStream = null;
+        }
+        toggleStreamBtn.innerText = "Start Camera";
+        statusDiv.innerText = "Camera stopped.";
+      }
+
+      toggleStreamBtn.addEventListener("click", () => {
+        if (isStreaming) {
+          stopStream();
+        } else {
+          startStream(cameraSelect.value);
+        }
+      });
+
+      cameraSelect.addEventListener("change", () => {
+        if (isStreaming) {
+          startStream(cameraSelect.value);
+        }
+      });
+
+      // Preprocessing using static buffer (NCHW 1x3x640x640)
+      function preprocess(videoElem) {
+        offscreenCtx.drawImage(videoElem, 0, 0, 640, 640);
+        const imgData = offscreenCtx.getImageData(0, 0, 640, 640).data;
+
+        for (let i = 0; i < 640 * 640; i++) {
+          inputFloat32Buffer[i] = imgData[i * 4] / 255.0; // R
+          inputFloat32Buffer[640 * 640 + i] = imgData[i * 4 + 1] / 255.0; // G
+          inputFloat32Buffer[2 * 640 * 640 + i] = imgData[i * 4 + 2] / 255.0; // B
+        }
+
+        return new ort.Tensor("float32", inputFloat32Buffer, [1, 3, 640, 640]);
+      }
+
+      function computeIoU(boxA, boxB) {
+        const xA = Math.max(boxA[0], boxB[0]);
+        const yA = Math.max(boxA[1], boxB[1]);
+        const xB = Math.min(boxA[2], boxB[2]);
+        const yB = Math.min(boxA[3], boxB[3]);
+
+        const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
+        const boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]);
+        const boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]);
+
+        return interArea / (boxAArea + boxBArea - interArea + 1e-6);
+      }
+
+      function nms(boxes, iouThreshold) {
+        boxes.sort((a, b) => b.score - a.score);
+        const selected = [];
+        for (let i = 0; i < boxes.length; i++) {
+          let keep = true;
+          for (let j = 0; j < selected.length; j++) {
+            if (boxes[i].classId === selected[j].classId && computeIoU(boxes[i].box, selected[j].box) > iouThreshold) {
+              keep = false;
+              break;
+            }
+          }
+          if (keep) selected.push(boxes[i]);
+        }
+        return selected;
+      }
+
+      const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+
+      function getClassColor(id) {
+        const colors = [
+          [255, 56, 56],
+          [255, 157, 151],
+          [255, 112, 31],
+          [255, 178, 29],
+          [207, 210, 49],
+          [72, 249, 10],
+          [146, 204, 23],
+          [61, 219, 134],
+          [26, 147, 65],
+          [35, 196, 196],
+          [47, 160, 255],
+          [0, 83, 235],
+        ];
+        return colors[id % colors.length];
+      }
+
+      // Non-blocking Animation Frame Inference Loop
+      async function renderLoop() {
+        if (!isStreaming) return;
+
+        // Ensure video is ready and inference isn't currently running
+        if (session && !isProcessing && video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+          isProcessing = true;
+          const startTime = performance.now();
+
+          try {
+            const tensor = preprocess(video);
+            const feeds = {};
+            feeds[session.inputNames[0]] = tensor;
+
+            const results = await session.run(feeds);
+            const duration = (performance.now() - startTime).toFixed(1);
+            const fps = (1000 / duration).toFixed(0);
+
+            const output0 = results[session.outputNames[0]];
+            const protoOutput = results[session.outputNames[1]];
+
+            const [batch, channels, numBoxes] = output0.dims;
+            const numMaskCoeffs = 32;
+            const numClasses = channels - 4 - numMaskCoeffs;
+            const outData = output0.data;
+            const protoData = protoOutput.data;
+
+            const confThres = parseFloat(confThresInput.value);
+            const iouThres = parseFloat(iouThresInput.value);
+            const rawDetections = [];
+
+            for (let i = 0; i < numBoxes; i++) {
+              let maxScore = 0;
+              let classId = -1;
+
+              for (let c = 0; c < numClasses; c++) {
+                const score = outData[(4 + c) * numBoxes + i];
+                if (score > maxScore) {
+                  maxScore = score;
+                  classId = c;
+                }
+              }
+
+              if (maxScore > confThres) {
+                const cx = outData[0 * numBoxes + i];
+                const cy = outData[1 * numBoxes + i];
+                const w = outData[2 * numBoxes + i];
+                const h = outData[3 * numBoxes + i];
+
+                const maskCoeffs = new Float32Array(numMaskCoeffs);
+                for (let m = 0; m < numMaskCoeffs; m++) {
+                  maskCoeffs[m] = outData[(4 + numClasses + m) * numBoxes + i];
+                }
+
+                rawDetections.push({
+                  box: [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2],
+                  score: maxScore,
+                  classId: classId,
+                  maskCoeffs: maskCoeffs,
+                });
+              }
+            }
+
+            const detections = nms(rawDetections, iouThres);
+
+            // Draw video feed frame
+            ctx.drawImage(video, 0, 0, 640, 640);
+
+            // Render Segmentations and Boxes
+            for (const det of detections) {
+              const [x1, y1, x2, y2] = det.box;
+              const color = getClassColor(det.classId);
+              const maskImgData = maskCtx.createImageData(160, 160);
+
+              const mx1 = Math.max(0, Math.floor(x1 / 4));
+              const my1 = Math.max(0, Math.floor(y1 / 4));
+              const mx2 = Math.min(160, Math.ceil(x2 / 4));
+              const my2 = Math.min(160, Math.ceil(y2 / 4));
+
+              for (let y = my1; y < my2; y++) {
+                for (let x = mx1; x < mx2; x++) {
+                  let sum = 0;
+                  for (let m = 0; m < numMaskCoeffs; m++) {
+                    sum += det.maskCoeffs[m] * protoData[m * 160 * 160 + y * 160 + x];
+                  }
+
+                  if (sigmoid(sum) > 0.5) {
+                    const idx = (y * 160 + x) * 4;
+                    maskImgData.data[idx] = color[0];
+                    maskImgData.data[idx + 1] = color[1];
+                    maskImgData.data[idx + 2] = color[2];
+                    maskImgData.data[idx + 3] = 125;
+                  }
+                }
+              }
+
+              maskCtx.putImageData(maskImgData, 0, 0);
+              ctx.drawImage(maskCanvas, 0, 0, 640, 640);
+
+              ctx.strokeStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+              ctx.lineWidth = 2;
+              ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+              ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+              ctx.fillRect(x1, Math.max(0, y1 - 18), 120, 18);
+              ctx.fillStyle = "white";
+              ctx.font = "12px sans-serif";
+              ctx.fillText(`Class ${det.classId}: ${(det.score * 100).toFixed(0)}%`, x1 + 4, Math.max(13, y1 - 4));
+            }
+
+            statusDiv.innerText = `Latency: ${duration} ms (~${fps} FPS) | Objects: ${detections.length}`;
+          } catch (err) {
+            console.error("Frame processing error:", err);
+          } finally {
+            isProcessing = false;
+          }
+        }
+
+        animFrameId = requestAnimationFrame(renderLoop);
+      }
+    </script>
+  </body>
+</html>
