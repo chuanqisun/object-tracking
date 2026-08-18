@@ -66,43 +66,121 @@ public:
         crow::json::wvalue res;
         std::vector<crow::json::wvalue> detections;
 
+        // Proposal structure for NMS
+        struct DetectionProposal {
+            int class_id;
+            float score;
+            float x1, y1, x2, y2;
+        };
+        std::vector<DetectionProposal> proposals;
+
         // In NCNN, out0 shape is either (38, num_boxes) or (num_boxes, 38)
-        int num_boxes = (out_det.h > 1) ? out_det.h : out_det.w;
-        int num_attrs = (out_det.h > 1) ? out_det.w : out_det.h;
+        int num_attrs = (out_det.h == 38 || (out_det.dims == 2 && out_det.h < out_det.w)) ? out_det.h : out_det.w;
+        // For 38 attribute channels: 4 box coords (cx, cy, w, h) + num_classes + 32 mask coefficients
+        int num_classes = std::max(1, num_attrs - 4 - 32);
 
         float score_threshold = 0.25f;
+        float nms_threshold = 0.45f;
 
         if (out_det.h == 38 || (out_det.dims == 2 && out_det.h < out_det.w)) {
             // Shape is (38, num_boxes) - transposed layout: channel/attribute is row
-            for (int i = 0; i < out_det.w; i++) {
-                float x1 = out_det.row(0)[i];
-                float y1 = out_det.row(1)[i];
-                float x2 = out_det.row(2)[i];
-                float y2 = out_det.row(3)[i];
-                float score = out_det.row(4)[i];
-                int class_id = (int)out_det.row(5)[i];
+            int num_boxes = out_det.w;
+            for (int i = 0; i < num_boxes; i++) {
+                float max_score = -1.0f;
+                int best_class_id = -1;
 
-                if (score > score_threshold) {
-                    crow::json::wvalue obj;
-                    obj["class_id"] = class_id;
-                    obj["score"] = score;
-                    obj["box"] = crow::json::wvalue::list({x1, y1, x2, y2});
-                    detections.push_back(obj);
+                // Search across all class scores (indices 4 .. 4 + num_classes - 1)
+                for (int c = 0; c < num_classes; c++) {
+                    float s = out_det.row(4 + c)[i];
+                    if (s > max_score) {
+                        max_score = s;
+                        best_class_id = c;
+                    }
+                }
+
+                if (max_score > score_threshold) {
+                    float cx = out_det.row(0)[i];
+                    float cy = out_det.row(1)[i];
+                    float w  = out_det.row(2)[i];
+                    float h  = out_det.row(3)[i];
+
+                    // Convert (cx, cy, w, h) to (x1, y1, x2, y2)
+                    float x1 = cx - w * 0.5f;
+                    float y1 = cy - h * 0.5f;
+                    float x2 = cx + w * 0.5f;
+                    float y2 = cy + h * 0.5f;
+
+                    proposals.push_back({best_class_id, max_score, x1, y1, x2, y2});
                 }
             }
         } else {
             // Shape is (num_boxes, 38) - standard layout: each row is a box
-            for (int i = 0; i < out_det.h; i++) {
+            int num_boxes = out_det.h;
+            for (int i = 0; i < num_boxes; i++) {
                 const float* values = out_det.row(i);
-                float score = values[4];
-                if (score > score_threshold) {
-                    crow::json::wvalue obj;
-                    obj["class_id"] = (int)values[5];
-                    obj["score"] = score;
-                    obj["box"] = crow::json::wvalue::list({values[0], values[1], values[2], values[3]});
-                    detections.push_back(obj);
+                float max_score = -1.0f;
+                int best_class_id = -1;
+
+                for (int c = 0; c < num_classes; c++) {
+                    float s = values[4 + c];
+                    if (s > max_score) {
+                        max_score = s;
+                        best_class_id = c;
+                    }
+                }
+
+                if (max_score > score_threshold) {
+                    float cx = values[0];
+                    float cy = values[1];
+                    float w  = values[2];
+                    float h  = values[3];
+
+                    float x1 = cx - w * 0.5f;
+                    float y1 = cy - h * 0.5f;
+                    float x2 = cx + w * 0.5f;
+                    float y2 = cy + h * 0.5f;
+
+                    proposals.push_back({best_class_id, max_score, x1, y1, x2, y2});
                 }
             }
+        }
+
+        // Apply Non-Maximum Suppression (NMS)
+        std::sort(proposals.begin(), proposals.end(), [](const DetectionProposal& a, const DetectionProposal& b) {
+            return a.score > b.score;
+        });
+
+        std::vector<DetectionProposal> kept;
+        for (const auto& prop : proposals) {
+            bool keep = true;
+            for (const auto& k : kept) {
+                float inter_x1 = std::max(prop.x1, k.x1);
+                float inter_y1 = std::max(prop.y1, k.y1);
+                float inter_x2 = std::min(prop.x2, k.x2);
+                float inter_y2 = std::min(prop.y2, k.y2);
+                float inter_w = std::max(0.0f, inter_x2 - inter_x1);
+                float inter_h = std::max(0.0f, inter_y2 - inter_y1);
+                float inter_area = inter_w * inter_h;
+                float area1 = (prop.x2 - prop.x1) * (prop.y2 - prop.y1);
+                float area2 = (k.x2 - k.x1) * (k.y2 - k.y1);
+                float iou = inter_area / (area1 + area2 - inter_area + 1e-6f);
+
+                if (iou > nms_threshold) {
+                    keep = false;
+                    break;
+                }
+            }
+            if (keep) {
+                kept.push_back(prop);
+            }
+        }
+
+        for (const auto& obj_det : kept) {
+            crow::json::wvalue obj;
+            obj["class_id"] = obj_det.class_id;
+            obj["score"] = obj_det.score;
+            obj["box"] = crow::json::wvalue::list({obj_det.x1, obj_det.y1, obj_det.x2, obj_det.y2});
+            detections.push_back(obj);
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -194,5 +272,10 @@ int main(int argc, char** argv) {
 
     int port = (argc >= 4) ? std::atoi(argv[3]) : 18888;
     std::cout << "Server starting on http://localhost:" << port << " (WebSocket at ws://localhost:" << port << "/ws)" << std::endl;
-    app.port(port).multithreaded().run();
+    try {
+        app.port(port).multithreaded().run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error starting server on port " << port << ": " << e.what() << std::endl;
+        return 1;
+    }
 }

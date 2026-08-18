@@ -50,4 +50,11 @@ echo " Bin:   $BIN_PATH"
 echo " Port:  $PORT"
 echo "=========================================="
 
+# Free port if occupied
+if command -v fuser &> /dev/null; then
+    fuser -k "${PORT}/tcp" 2>/dev/null || true
+elif command -v lsof &> /dev/null; then
+    lsof -ti:"${PORT}" | xargs -r kill -9 2>/dev/null || true
+fi
+
 exec "$EXECUTABLE" "$PARAM_PATH" "$BIN_PATH" "$PORT"
