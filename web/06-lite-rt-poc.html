@@ -13,6 +13,12 @@
     </div>
 
     <div style="margin-bottom: 10px">
+      <label for="imgWidthInput">Image Size (px): </label>
+      <input type="number" id="imgWidthInput" value="640" min="32" max="4096" step="32" style="width: 70px" /> x
+      <input type="number" id="imgHeightInput" value="640" min="32" max="4096" step="32" style="width: 70px" />
+    </div>
+
+    <div style="margin-bottom: 10px">
       <label for="acceleratorSelect">Accelerator: </label>
       <select id="acceleratorSelect">
         <option value="auto" selected>Auto (WebGPU with CPU/WASM Fallback)</option>
@@ -26,6 +32,7 @@
       <select id="cameraSelect">
         <option value="">Default / Auto</option>
       </select>
+      <button id="scanBtn">Scan Cameras</button>
       <button id="startBtn" disabled>Start Camera</button>
       <button id="stopBtn" disabled>Stop Camera</button>
     </div>
@@ -48,9 +55,6 @@
     <script type="module">
       import { loadLiteRt, loadAndCompile, Tensor } from "https://cdn.jsdelivr.net/npm/@litertjs/core@latest/+esm";
 
-      const INPUT_WIDTH = 640;
-      const INPUT_HEIGHT = 640;
-
       let model = null;
       let stream = null;
       let isRunning = false;
@@ -71,10 +75,67 @@
       const cameraSelect = document.getElementById("cameraSelect");
       const acceleratorSelect = document.getElementById("acceleratorSelect");
       const modelFileInput = document.getElementById("modelFileInput");
+      const imgWidthInput = document.getElementById("imgWidthInput");
+      const imgHeightInput = document.getElementById("imgHeightInput");
+      const scanBtn = document.getElementById("scanBtn");
       const startBtn = document.getElementById("startBtn");
       const stopBtn = document.getElementById("stopBtn");
 
-      // 1. Populate camera dropdown (called after permission is granted)
+      function getInputDimensions() {
+        const w = parseInt(imgWidthInput.value, 10) || 640;
+        const h = parseInt(imgHeightInput.value, 10) || 640;
+        return { width: w, height: h };
+      }
+
+      function updateCanvasDimensions() {
+        const { width, height } = getInputDimensions();
+        canvas.width = width;
+        canvas.height = height;
+        processCanvas.width = width;
+        processCanvas.height = height;
+      }
+
+      imgWidthInput.addEventListener("change", updateCanvasDimensions);
+      imgHeightInput.addEventListener("change", updateCanvasDimensions);
+
+      // 1. Scan and populate camera dropdown (decoupled from Start)
+      async function scanCameras(activeDeviceId = "") {
+        try {
+          statusEl.innerText = "Scanning for cameras...";
+          // Request camera permission briefly to ensure labels are populated
+          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          tempStream.getTracks().forEach((track) => track.stop());
+
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoDevices = devices.filter((d) => d.kind === "videoinput");
+
+          if (videoDevices.length === 0) {
+            cameraSelect.innerHTML = '<option value="">No cameras found</option>';
+            statusEl.innerText = "Camera scan complete: No devices found.";
+            return;
+          }
+
+          const currentVal = activeDeviceId || cameraSelect.value;
+          cameraSelect.innerHTML = "";
+          videoDevices.forEach((device, idx) => {
+            const opt = document.createElement("option");
+            opt.value = device.deviceId;
+            opt.text = device.label || `Camera ${idx + 1}`;
+            if (device.deviceId === currentVal || (!currentVal && idx === 0)) {
+              opt.selected = true;
+            }
+            cameraSelect.appendChild(opt);
+          });
+          camerasEnumerated = true;
+          statusEl.innerText = `Camera scan complete: Found ${videoDevices.length} camera(s).`;
+        } catch (err) {
+          statusEl.innerText = `Camera scan failed: ${err.message}`;
+          console.warn("Could not scan cameras:", err);
+        }
+      }
+
+      scanBtn.addEventListener("click", () => scanCameras());
+
       async function updateCameraList(activeDeviceId = "") {
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
@@ -208,12 +269,23 @@
         }
       });
 
-      // 5. Preprocessing: Planar float NCHW [1, 3, 640, 640]
+      // 5. Preprocessing: Planar float NCHW [1, 3, H, W]
       function preprocessFrame() {
-        processCtx.drawImage(video, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
-        const imgData = processCtx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT).data;
+        const { width: inputWidth, height: inputHeight } = getInputDimensions();
 
-        const numPixels = INPUT_WIDTH * INPUT_HEIGHT;
+        if (processCanvas.width !== inputWidth || processCanvas.height !== inputHeight) {
+          processCanvas.width = inputWidth;
+          processCanvas.height = inputHeight;
+        }
+        if (canvas.width !== inputWidth || canvas.height !== inputHeight) {
+          canvas.width = inputWidth;
+          canvas.height = inputHeight;
+        }
+
+        processCtx.drawImage(video, 0, 0, inputWidth, inputHeight);
+        const imgData = processCtx.getImageData(0, 0, inputWidth, inputHeight).data;
+
+        const numPixels = inputWidth * inputHeight;
         const chwFloatArray = new Float32Array(numPixels * 3);
 
         for (let i = 0; i < numPixels; i++) {
@@ -226,7 +298,7 @@
           chwFloatArray[numPixels * 2 + i] = b;
         }
 
-        return new Tensor(chwFloatArray, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
+        return new Tensor(chwFloatArray, [1, 3, inputHeight, inputWidth]);
       }
 
       // 6. Main Inference and Rendering Loop
@@ -279,12 +351,15 @@
       // Camera control handlers: requests permission only when user clicks "Start Camera"
       startBtn.addEventListener("click", async () => {
         statusEl.innerText = "Requesting camera permissions...";
+        const { width: inputWidth, height: inputHeight } = getInputDimensions();
+        updateCanvasDimensions();
+
         const selectedDeviceId = cameraSelect.value;
         const constraints = {
           video: {
             deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
-            width: { ideal: INPUT_WIDTH },
-            height: { ideal: INPUT_HEIGHT },
+            width: { ideal: inputWidth },
+            height: { ideal: inputHeight },
           },
           audio: false,
         };
