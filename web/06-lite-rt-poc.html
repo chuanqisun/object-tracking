@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>LiteRT.js YOLO Segmentation POC</title>
+  </head>
+  <body>
+    <h2>LiteRT.js Webcam Inference POC</h2>
+
+    <div style="margin-bottom: 10px">
+      <label for="modelFileInput"><strong>Upload Model (.tflite): </strong></label>
+      <input type="file" id="modelFileInput" accept=".tflite" />
+    </div>
+
+    <div style="margin-bottom: 10px">
+      <label for="acceleratorSelect">Accelerator: </label>
+      <select id="acceleratorSelect">
+        <option value="auto" selected>Auto (WebGPU with CPU/WASM Fallback)</option>
+        <option value="webgpu">WebGPU</option>
+        <option value="wasm">WASM (CPU / XNNPACK)</option>
+      </select>
+    </div>
+
+    <div>
+      <label for="cameraSelect">Camera: </label>
+      <select id="cameraSelect">
+        <option value="">Default / Auto</option>
+      </select>
+      <button id="startBtn" disabled>Start Camera</button>
+      <button id="stopBtn" disabled>Stop Camera</button>
+    </div>
+
+    <div style="margin-top: 10px">
+      <strong>Backend:</strong> <span id="backendBadge">None</span> | <strong>Status:</strong> <span id="status">Loading LiteRT runtime...</span> |
+      <strong>FPS:</strong> <span id="fps">0</span>
+    </div>
+
+    <div style="position: relative; margin-top: 15px">
+      <!-- Hidden source video stream -->
+      <video id="webcam" playsinline style="display: none"></video>
+      <!-- Display canvas for input frame and detection tracking overlay -->
+      <canvas id="outputCanvas" width="640" height="640" style="border: 1px solid #000"></canvas>
+    </div>
+
+    <!-- Offscreen canvas for CHW normalization -->
+    <canvas id="processCanvas" width="640" height="640" style="display: none"></canvas>
+
+    <script type="module">
+      import { loadLiteRt, loadAndCompile, Tensor } from "https://cdn.jsdelivr.net/npm/@litertjs/core@latest/+esm";
+
+      const INPUT_WIDTH = 640;
+      const INPUT_HEIGHT = 640;
+
+      let model = null;
+      let stream = null;
+      let isRunning = false;
+      let frameCount = 0;
+      let fpsTimer = performance.now();
+      let runtimeReady = false;
+      let cachedModelBuffer = null;
+      let camerasEnumerated = false;
+
+      const video = document.getElementById("webcam");
+      const canvas = document.getElementById("outputCanvas");
+      const ctx = canvas.getContext("2d");
+      const processCanvas = document.getElementById("processCanvas");
+      const processCtx = processCanvas.getContext("2d", { willReadFrequently: true });
+      const statusEl = document.getElementById("status");
+      const fpsEl = document.getElementById("fps");
+      const backendBadge = document.getElementById("backendBadge");
+      const cameraSelect = document.getElementById("cameraSelect");
+      const acceleratorSelect = document.getElementById("acceleratorSelect");
+      const modelFileInput = document.getElementById("modelFileInput");
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+
+      // 1. Populate camera dropdown (called after permission is granted)
+      async function updateCameraList(activeDeviceId = "") {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoDevices = devices.filter((d) => d.kind === "videoinput");
+
+          if (videoDevices.length === 0) return;
+
+          cameraSelect.innerHTML = "";
+          videoDevices.forEach((device, idx) => {
+            const opt = document.createElement("option");
+            opt.value = device.deviceId;
+            opt.text = device.label || `Camera ${idx + 1}`;
+            if (device.deviceId === activeDeviceId || (!activeDeviceId && idx === 0)) {
+              opt.selected = true;
+            }
+            cameraSelect.appendChild(opt);
+          });
+          camerasEnumerated = true;
+        } catch (err) {
+          console.warn("Could not enumerate cameras:", err);
+        }
+      }
+
+      // 2. Check if the browser environment has an active WebGPU adapter
+      async function checkWebGpuSupport() {
+        if (!("gpu" in navigator)) return false;
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          return !!adapter;
+        } catch {
+          return false;
+        }
+      }
+
+      // 3. Initialize LiteRT WebAssembly Runtime
+      async function initRuntime() {
+        try {
+          statusEl.innerText = "Loading LiteRT Wasm runtime...";
+          await loadLiteRt("https://cdn.jsdelivr.net/npm/@litertjs/core/wasm/");
+          runtimeReady = true;
+          statusEl.innerText = "Runtime initialized. Please select a .tflite model file to load.";
+        } catch (err) {
+          statusEl.innerText = `Failed to load LiteRT runtime: ${err.message}`;
+          console.error(err);
+        }
+      }
+
+      // 4. Compile Model with Automatic Fallback
+      async function compileModel(modelUint8Array, requestedAccelerator = "auto") {
+        if (model && typeof model.delete === "function") {
+          model.delete();
+          model = null;
+        }
+
+        const hasGpu = await checkWebGpuSupport();
+
+        if (requestedAccelerator === "webgpu") {
+          if (!hasGpu) {
+            throw new Error("WebGPU is not supported or enabled in this browser window.");
+          }
+          statusEl.innerText = "Compiling on WebGPU...";
+          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
+          backendBadge.innerText = "WebGPU";
+          return compiled;
+        } else if (requestedAccelerator === "wasm") {
+          statusEl.innerText = "Compiling on CPU (WASM / XNNPACK)...";
+          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
+          backendBadge.innerText = "WASM (CPU)";
+          return compiled;
+        } else {
+          if (hasGpu) {
+            try {
+              statusEl.innerText = "Attempting compilation on WebGPU...";
+              const compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
+              backendBadge.innerText = "WebGPU";
+              return compiled;
+            } catch (gpuErr) {
+              console.warn("WebGPU compilation failed, falling back to WASM:", gpuErr);
+            }
+          }
+          statusEl.innerText = "Falling back to CPU (WASM / XNNPACK)...";
+          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
+          backendBadge.innerText = "WASM (CPU Fallback)";
+          return compiled;
+        }
+      }
+
+      // Handle manual model file upload
+      modelFileInput.addEventListener("change", async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        if (!runtimeReady) {
+          statusEl.innerText = "LiteRT runtime is still initializing, please wait...";
+          return;
+        }
+
+        try {
+          statusEl.innerText = `Reading model file: ${file.name}...`;
+          const arrayBuffer = await file.arrayBuffer();
+          cachedModelBuffer = new Uint8Array(arrayBuffer);
+
+          model = await compileModel(cachedModelBuffer, acceleratorSelect.value);
+
+          statusEl.innerText = `Model "${file.name}" loaded (${backendBadge.innerText}). Click "Start Camera" to begin.`;
+          startBtn.disabled = false;
+        } catch (err) {
+          statusEl.innerText = `Failed to compile model: ${err.message}`;
+          backendBadge.innerText = "Error";
+          startBtn.disabled = true;
+          console.error(err);
+        }
+      });
+
+      // Recompile if user changes accelerator
+      acceleratorSelect.addEventListener("change", async () => {
+        if (!cachedModelBuffer) return;
+        try {
+          const wasRunning = isRunning;
+          isRunning = false;
+          model = await compileModel(cachedModelBuffer, acceleratorSelect.value);
+          statusEl.innerText = `Model recompiled with ${backendBadge.innerText}.`;
+          if (wasRunning) {
+            isRunning = true;
+            requestAnimationFrame(renderLoop);
+          }
+        } catch (err) {
+          statusEl.innerText = `Failed to switch accelerator: ${err.message}`;
+          backendBadge.innerText = "Error";
+          console.error(err);
+        }
+      });
+
+      // 5. Preprocessing: Planar float NCHW [1, 3, 640, 640]
+      function preprocessFrame() {
+        processCtx.drawImage(video, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+        const imgData = processCtx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT).data;
+
+        const numPixels = INPUT_WIDTH * INPUT_HEIGHT;
+        const chwFloatArray = new Float32Array(numPixels * 3);
+
+        for (let i = 0; i < numPixels; i++) {
+          const r = imgData[i * 4] / 255.0;
+          const g = imgData[i * 4 + 1] / 255.0;
+          const b = imgData[i * 4 + 2] / 255.0;
+
+          chwFloatArray[i] = r;
+          chwFloatArray[numPixels + i] = g;
+          chwFloatArray[numPixels * 2 + i] = b;
+        }
+
+        return new Tensor(chwFloatArray, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
+      }
+
+      // 6. Main Inference and Rendering Loop
+      async function renderLoop() {
+        if (!isRunning) return;
+
+        if (video.readyState >= 2 && model) {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const inputTensor = preprocessFrame();
+
+          try {
+            const outputs = await model.run(inputTensor);
+
+            if (outputs && outputs.length > 0) {
+              const outTensor = outputs[0];
+              const outData = await outTensor.data();
+
+              ctx.strokeStyle = "#00FF00";
+              ctx.lineWidth = 2;
+              ctx.strokeRect(10, 10, canvas.width - 20, canvas.height - 20);
+
+              ctx.fillStyle = "#00FF00";
+              ctx.font = "14px monospace";
+              ctx.fillText(`Backend: ${backendBadge.innerText}`, 20, 35);
+              ctx.fillText(`Output Shape: [${outTensor.shape ? outTensor.shape.join(", ") : "Ready"}]`, 20, 55);
+              ctx.fillText(`Tracking / Output: ${outData.length > 0 ? "Active" : "Idle"}`, 20, 75);
+
+              for (let i = 0; i < outputs.length; i++) {
+                outputs[i].delete();
+              }
+            }
+          } catch (inferenceErr) {
+            console.error("Inference error:", inferenceErr);
+          } finally {
+            inputTensor.delete();
+          }
+
+          frameCount++;
+          const now = performance.now();
+          if (now - fpsTimer >= 1000) {
+            fpsEl.innerText = ((frameCount * 1000) / (now - fpsTimer)).toFixed(1);
+            frameCount = 0;
+            fpsTimer = now;
+          }
+        }
+
+        requestAnimationFrame(renderLoop);
+      }
+
+      // Camera control handlers: requests permission only when user clicks "Start Camera"
+      startBtn.addEventListener("click", async () => {
+        statusEl.innerText = "Requesting camera permissions...";
+        const selectedDeviceId = cameraSelect.value;
+        const constraints = {
+          video: {
+            deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+            width: { ideal: INPUT_WIDTH },
+            height: { ideal: INPUT_HEIGHT },
+          },
+          audio: false,
+        };
+
+        try {
+          if (stream) {
+            stream.getTracks().forEach((track) => track.stop());
+          }
+
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          video.srcObject = stream;
+          await video.play();
+
+          // Populate and update device labels now that permission has been granted
+          const videoTrack = stream.getVideoTracks()[0];
+          const activeDeviceId = videoTrack?.getSettings()?.deviceId || selectedDeviceId;
+          await updateCameraList(activeDeviceId);
+
+          isRunning = true;
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+          cameraSelect.disabled = false;
+          statusEl.innerText = "Inference and tracking active.";
+          requestAnimationFrame(renderLoop);
+        } catch (err) {
+          statusEl.innerText = `Camera access error: ${err.message}`;
+          console.error(err);
+        }
+      });
+
+      // Handle switching camera from dropdown while running or ready
+      cameraSelect.addEventListener("change", async () => {
+        if (isRunning) {
+          startBtn.click(); // restart stream with selected deviceId
+        }
+      });
+
+      stopBtn.addEventListener("click", () => {
+        isRunning = false;
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          stream = null;
+        }
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        statusEl.innerText = "Camera stopped.";
+      });
+
+      // Boot Runtime
+      initRuntime();
+    </script>
+  </body>
+</html>
