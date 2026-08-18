@@ -6,11 +6,12 @@ High-performance, low-latency C++ inference server for YOLO26 segmentation model
 
 ## Overview
 
-This C++ HTTP inference server leverages **NCNN** with Vulkan acceleration and **Crow** (a lightweight micro web framework) to provide high-throughput object detection and instance segmentation inference.
+This C++ backend inference server leverages **NCNN** with Vulkan acceleration and **Crow** (a lightweight micro web framework) to provide high-throughput, low-latency object detection and instance segmentation inference over WebSocket and HTTP POST endpoints.
 
 - **Engine:** NCNN (Vulkan Compute API, FP16/Packed)
 - **Server:** Crow (Header-only micro-framework built on Asio)
 - **Image Processing:** OpenCV 4
+- **Endpoints:** WebSocket (`/ws`) for streaming inference and HTTP POST (`/predict`) with CORS support.
 - **Target Hardware:** AMD Radeon 890M iGPU (RDNA 3.5 / GFX1150) or any Vulkan-capable GPU / CPU.
 
 ---
@@ -78,7 +79,13 @@ curl -L -o crow_all.h https://github.com/CrowCpp/Crow/releases/download/v1.2.0/c
 
 ## 4. Build the C++ Inference Server
 
-Set `PKG_CONFIG_PATH` to point to the NCNN pkgconfig directory, then compile `server.cpp`:
+You can build using the `build.sh` script:
+
+```bash
+./build.sh
+```
+
+Or manually set `PKG_CONFIG_PATH` to point to the NCNN pkgconfig directory and compile `server.cpp`:
 
 ```bash
 export PKG_CONFIG_PATH=/home/stack/repos/ncnn/build/install/lib64/pkgconfig:$PKG_CONFIG_PATH
@@ -95,35 +102,70 @@ g++ -O3 -march=native -fopenmp \
 
 ---
 
-## 5. Running the Server
+## 5. Running the Inference Server
 
-Run `yolo_server` by passing the NCNN `.param` file, `.bin` file, and an optional port number (default: 8080):
+You can start the server using `run.sh`:
+
+```bash
+./run.sh [param_path] [bin_path] [port]
+```
+
+Or run `yolo_server` directly by passing the NCNN `.param` file path, `.bin` file path, and an optional port number (default: `18888`):
 
 ```bash
 # Usage: ./yolo_server <path_to_param> <path_to_bin> [port]
 
-./yolo_server ../puck-eye-seg-s_ncnn_model/model.ncnn.param ../puck-eye-seg-s_ncnn_model/model.ncnn.bin 8080
+cd inference
+./yolo_server ../puck-eye-seg-s_ncnn_model/model.ncnn.param ../puck-eye-seg-s_ncnn_model/model.ncnn.bin 18888
+```
+
+When started, the server outputs:
+
+```text
+Loading NCNN model: ../puck-eye-seg-s_ncnn_model/model.ncnn.param and ../puck-eye-seg-s_ncnn_model/model.ncnn.bin
+Server starting on http://localhost:18888 (WebSocket at ws://localhost:18888/ws)
 ```
 
 ---
 
-## 6. Testing Inference
+## 6. Server Endpoints & API Protocol
 
-Send an image via HTTP POST to the `/predict` endpoint:
+### WebSocket Stream Endpoint (`ws://localhost:18888/ws`)
+
+- **Input:** Raw image binary buffer (JPEG / PNG byte array).
+- **Output:** JSON string with detection bounding boxes and GPU execution latency (`infer_ms`).
+
+### HTTP POST Endpoint (`http://localhost:18888/predict`)
+
+- **Method:** `POST` (supports `OPTIONS` for CORS pre-flight)
+- **Body:** Binary image data (`Content-Type: application/octet-stream` or `image/jpeg`)
+- **Output:** JSON response containing detections, image dimensions, and GPU inference time.
+
+---
+
+## 7. Testing the Server
+
+### Testing HTTP Endpoint with `curl`
+
+Send an image via HTTP POST to verify model execution:
 
 ```bash
-curl -s -X POST --data-binary @sample.jpg http://localhost:8080/predict
+curl -s -X POST --data-binary @sample.jpg http://localhost:18888/predict
 ```
 
-### Example Output
+#### Example Response JSON
 
 ```json
 {
+  "img_w": 640,
+  "img_h": 640,
+  "target_size": 640,
+  "infer_ms": 3.42,
   "detections": [
     {
       "class_id": 0,
       "score": 0.745117,
-      "box": [247.125, 318.5, 41.75, 78.0]
+      "box": [247.125, 318.5, 417.5, 396.5]
     }
   ]
 }
@@ -135,9 +177,8 @@ curl -s -X POST --data-binary @sample.jpg http://localhost:8080/predict
 
 ```
 inference/
-├── server.cpp       # C++ HTTP inference engine (Crow + NCNN Vulkan)
+├── server.cpp       # C++ NCNN Vulkan WebSocket & HTTP inference server
 ├── crow_all.h       # Crow micro web framework header
-├── yolo_server      # Compiled executable binary
-├── sample.jpg       # Sample test image
-└── README.md        # Official getting started guide
+├── yolo_server      # Compiled binary executable
+└── README.md        # Server setup & execution guide
 ```
