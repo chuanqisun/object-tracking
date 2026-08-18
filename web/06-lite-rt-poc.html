@@ -2,23 +2,45 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>LiteRT.js YOLO Segmentation POC</title>
+    <title>LiteRT.js YOLO Detection POC</title>
+    <style>
+      body {
+        font-family: monospace, sans-serif;
+        padding: 16px;
+      }
+      .control-row {
+        margin-bottom: 8px;
+      }
+      label {
+        font-weight: bold;
+      }
+      input,
+      select,
+      button {
+        font-family: inherit;
+      }
+    </style>
   </head>
   <body>
-    <h2>LiteRT.js Webcam Inference POC</h2>
+    <h2>LiteRT.js Webcam YOLO Detection POC</h2>
 
-    <div style="margin-bottom: 10px">
-      <label for="modelFileInput"><strong>Upload Model (.tflite): </strong></label>
+    <div class="control-row">
+      <label for="modelFileInput">Upload Model (.tflite): </label>
       <input type="file" id="modelFileInput" accept=".tflite" />
     </div>
 
-    <div style="margin-bottom: 10px">
-      <label for="imgWidthInput">Image Size (px): </label>
-      <input type="number" id="imgWidthInput" value="640" min="32" max="4096" step="32" style="width: 70px" /> x
-      <input type="number" id="imgHeightInput" value="640" min="32" max="4096" step="32" style="width: 70px" />
+    <div class="control-row">
+      <label for="imgWidthInput">Model Input Size: </label>
+      <input type="number" id="imgWidthInput" value="640" min="32" max="4096" step="32" style="width: 60px" /> x
+      <input type="number" id="imgHeightInput" value="640" min="32" max="4096" step="32" style="width: 60px" />
+      |
+      <label for="confThreshInput">Conf: </label>
+      <input type="number" id="confThreshInput" value="0.25" min="0.01" max="1.0" step="0.05" style="width: 55px" />
+      <label for="iouThreshInput">IoU: </label>
+      <input type="number" id="iouThreshInput" value="0.45" min="0.01" max="1.0" step="0.05" style="width: 55px" />
     </div>
 
-    <div style="margin-bottom: 10px">
+    <div class="control-row">
       <label for="acceleratorSelect">Accelerator: </label>
       <select id="acceleratorSelect">
         <option value="auto" selected>Auto (WebGPU with CPU/WASM Fallback)</option>
@@ -27,7 +49,7 @@
       </select>
     </div>
 
-    <div>
+    <div class="control-row">
       <label for="cameraSelect">Camera: </label>
       <select id="cameraSelect">
         <option value="">Default / Auto</option>
@@ -37,23 +59,130 @@
       <button id="stopBtn" disabled>Stop Camera</button>
     </div>
 
-    <div style="margin-top: 10px">
+    <div class="control-row" style="margin-top: 10px">
       <strong>Backend:</strong> <span id="backendBadge">None</span> | <strong>Status:</strong> <span id="status">Loading LiteRT runtime...</span> |
-      <strong>FPS:</strong> <span id="fps">0</span>
+      <strong>FPS:</strong> <span id="fps">0</span> | <strong>Detections:</strong> <span id="detCount">0</span>
     </div>
 
-    <div style="position: relative; margin-top: 15px">
+    <div style="position: relative; margin-top: 10px">
       <!-- Hidden source video stream -->
       <video id="webcam" playsinline style="display: none"></video>
       <!-- Display canvas for input frame and detection tracking overlay -->
-      <canvas id="outputCanvas" width="640" height="640" style="border: 1px solid #000"></canvas>
+      <canvas id="outputCanvas" width="640" height="640" style="border: 1px solid #333; max-width: 100%; height: auto"></canvas>
     </div>
 
-    <!-- Offscreen canvas for CHW normalization -->
+    <!-- Offscreen canvas for frame resizing & normalization -->
     <canvas id="processCanvas" width="640" height="640" style="display: none"></canvas>
 
     <script type="module">
       import { loadLiteRt, loadAndCompile, Tensor } from "https://cdn.jsdelivr.net/npm/@litertjs/core@latest/+esm";
+
+      const COCO_CLASSES = [
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "backpack",
+        "umbrella",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "dining table",
+        "toilet",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush",
+      ];
+
+      const COLORS = [
+        "#00FF00",
+        "#FF3838",
+        "#FF9D97",
+        "#FF701F",
+        "#FFB21D",
+        "#CFD231",
+        "#48F90A",
+        "#92CC17",
+        "#3DDB86",
+        "#1A9334",
+        "#00D4BB",
+        "#2C99A8",
+        "#00C2FF",
+        "#344593",
+        "#6473FF",
+        "#0018EC",
+        "#8438FF",
+        "#520085",
+        "#CB38FF",
+        "#FF95C8",
+        "#FF37C7",
+      ];
 
       let model = null;
       let stream = null;
@@ -62,7 +191,6 @@
       let fpsTimer = performance.now();
       let runtimeReady = false;
       let cachedModelBuffer = null;
-      let camerasEnumerated = false;
 
       const video = document.getElementById("webcam");
       const canvas = document.getElementById("outputCanvas");
@@ -71,12 +199,15 @@
       const processCtx = processCanvas.getContext("2d", { willReadFrequently: true });
       const statusEl = document.getElementById("status");
       const fpsEl = document.getElementById("fps");
+      const detCountEl = document.getElementById("detCount");
       const backendBadge = document.getElementById("backendBadge");
       const cameraSelect = document.getElementById("cameraSelect");
       const acceleratorSelect = document.getElementById("acceleratorSelect");
       const modelFileInput = document.getElementById("modelFileInput");
       const imgWidthInput = document.getElementById("imgWidthInput");
       const imgHeightInput = document.getElementById("imgHeightInput");
+      const confThreshInput = document.getElementById("confThreshInput");
+      const iouThreshInput = document.getElementById("iouThreshInput");
       const scanBtn = document.getElementById("scanBtn");
       const startBtn = document.getElementById("startBtn");
       const stopBtn = document.getElementById("stopBtn");
@@ -98,13 +229,43 @@
       imgWidthInput.addEventListener("change", updateCanvasDimensions);
       imgHeightInput.addEventListener("change", updateCanvasDimensions);
 
-      // 1. Scan and populate camera dropdown (decoupled from Start)
+      // Inspect model input tensor shape and update UI/canvas automatically
+      function syncDimensionsFromModel(compiledModel) {
+        try {
+          if (typeof compiledModel.getInputDetails === "function") {
+            const inputs = compiledModel.getInputDetails();
+            if (inputs && inputs.length > 0 && inputs[0].shape) {
+              const shape = inputs[0].shape;
+              let h, w;
+              if (shape.length === 4) {
+                // NCHW: [1, 3, H, W]
+                if (shape[1] === 3 || shape[1] === 1) {
+                  h = shape[2];
+                  w = shape[3];
+                } else {
+                  // NHWC: [1, H, W, 3]
+                  h = shape[1];
+                  w = shape[2];
+                }
+              }
+              if (h && w) {
+                imgWidthInput.value = w;
+                imgHeightInput.value = h;
+                updateCanvasDimensions();
+                console.log(`Auto-configured model input dimensions: ${w}x${h}`);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Could not read inputDetails from model:", e);
+        }
+      }
+
       async function scanCameras(activeDeviceId = "") {
         try {
           statusEl.innerText = "Scanning for cameras...";
-          // Request camera permission briefly to ensure labels are populated
           const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-          tempStream.getTracks().forEach((track) => track.stop());
+          tempStream.getTracks().forEach((t) => t.stop());
 
           const devices = await navigator.mediaDevices.enumerateDevices();
           const videoDevices = devices.filter((d) => d.kind === "videoinput");
@@ -126,7 +287,6 @@
             }
             cameraSelect.appendChild(opt);
           });
-          camerasEnumerated = true;
           statusEl.innerText = `Camera scan complete: Found ${videoDevices.length} camera(s).`;
         } catch (err) {
           statusEl.innerText = `Camera scan failed: ${err.message}`;
@@ -140,7 +300,6 @@
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
           const videoDevices = devices.filter((d) => d.kind === "videoinput");
-
           if (videoDevices.length === 0) return;
 
           cameraSelect.innerHTML = "";
@@ -153,13 +312,11 @@
             }
             cameraSelect.appendChild(opt);
           });
-          camerasEnumerated = true;
         } catch (err) {
           console.warn("Could not enumerate cameras:", err);
         }
       }
 
-      // 2. Check if the browser environment has an active WebGPU adapter
       async function checkWebGpuSupport() {
         if (!("gpu" in navigator)) return false;
         try {
@@ -170,7 +327,6 @@
         }
       }
 
-      // 3. Initialize LiteRT WebAssembly Runtime
       async function initRuntime() {
         try {
           statusEl.innerText = "Loading LiteRT Wasm runtime...";
@@ -183,7 +339,6 @@
         }
       }
 
-      // 4. Compile Model with Automatic Fallback
       async function compileModel(modelUint8Array, requestedAccelerator = "auto") {
         if (model && typeof model.delete === "function") {
           model.delete();
@@ -191,39 +346,38 @@
         }
 
         const hasGpu = await checkWebGpuSupport();
+        let compiled = null;
 
         if (requestedAccelerator === "webgpu") {
-          if (!hasGpu) {
-            throw new Error("WebGPU is not supported or enabled in this browser window.");
-          }
+          if (!hasGpu) throw new Error("WebGPU is not supported or enabled in this browser window.");
           statusEl.innerText = "Compiling on WebGPU...";
-          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
+          compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
           backendBadge.innerText = "WebGPU";
-          return compiled;
         } else if (requestedAccelerator === "wasm") {
           statusEl.innerText = "Compiling on CPU (WASM / XNNPACK)...";
-          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
+          compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
           backendBadge.innerText = "WASM (CPU)";
-          return compiled;
         } else {
           if (hasGpu) {
             try {
               statusEl.innerText = "Attempting compilation on WebGPU...";
-              const compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
+              compiled = await loadAndCompile(modelUint8Array, { accelerator: "webgpu" });
               backendBadge.innerText = "WebGPU";
-              return compiled;
             } catch (gpuErr) {
               console.warn("WebGPU compilation failed, falling back to WASM:", gpuErr);
             }
           }
-          statusEl.innerText = "Falling back to CPU (WASM / XNNPACK)...";
-          const compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
-          backendBadge.innerText = "WASM (CPU Fallback)";
-          return compiled;
+          if (!compiled) {
+            statusEl.innerText = "Falling back to CPU (WASM / XNNPACK)...";
+            compiled = await loadAndCompile(modelUint8Array, { accelerator: "wasm" });
+            backendBadge.innerText = "WASM (CPU Fallback)";
+          }
         }
+
+        syncDimensionsFromModel(compiled);
+        return compiled;
       }
 
-      // Handle manual model file upload
       modelFileInput.addEventListener("change", async (event) => {
         const file = event.target.files[0];
         if (!file) return;
@@ -240,7 +394,7 @@
 
           model = await compileModel(cachedModelBuffer, acceleratorSelect.value);
 
-          statusEl.innerText = `Model "${file.name}" loaded (${backendBadge.innerText}). Click "Start Camera" to begin.`;
+          statusEl.innerText = `Model "${file.name}" loaded (${backendBadge.innerText}) at ${imgWidthInput.value}x${imgHeightInput.value}. Click "Start Camera".`;
           startBtn.disabled = false;
         } catch (err) {
           statusEl.innerText = `Failed to compile model: ${err.message}`;
@@ -250,7 +404,6 @@
         }
       });
 
-      // Recompile if user changes accelerator
       acceleratorSelect.addEventListener("change", async () => {
         if (!cachedModelBuffer) return;
         try {
@@ -269,17 +422,13 @@
         }
       });
 
-      // 5. Preprocessing: Planar float NCHW [1, 3, H, W]
+      // Preprocessing: Planar NCHW [1, 3, H, W] normalized float32
       function preprocessFrame() {
         const { width: inputWidth, height: inputHeight } = getInputDimensions();
 
         if (processCanvas.width !== inputWidth || processCanvas.height !== inputHeight) {
           processCanvas.width = inputWidth;
           processCanvas.height = inputHeight;
-        }
-        if (canvas.width !== inputWidth || canvas.height !== inputHeight) {
-          canvas.width = inputWidth;
-          canvas.height = inputHeight;
         }
 
         processCtx.drawImage(video, 0, 0, inputWidth, inputHeight);
@@ -289,24 +438,155 @@
         const chwFloatArray = new Float32Array(numPixels * 3);
 
         for (let i = 0; i < numPixels; i++) {
-          const r = imgData[i * 4] / 255.0;
-          const g = imgData[i * 4 + 1] / 255.0;
-          const b = imgData[i * 4 + 2] / 255.0;
-
-          chwFloatArray[i] = r;
-          chwFloatArray[numPixels + i] = g;
-          chwFloatArray[numPixels * 2 + i] = b;
+          chwFloatArray[i] = imgData[i * 4] / 255.0; // R
+          chwFloatArray[numPixels + i] = imgData[i * 4 + 1] / 255.0; // G
+          chwFloatArray[numPixels * 2 + i] = imgData[i * 4 + 2] / 255.0; // B
         }
 
         return new Tensor(chwFloatArray, [1, 3, inputHeight, inputWidth]);
       }
 
-      // 6. Main Inference and Rendering Loop
+      function iou(boxA, boxB) {
+        const x1 = Math.max(boxA.x1, boxB.x1);
+        const y1 = Math.max(boxA.y1, boxB.y1);
+        const x2 = Math.min(boxA.x2, boxB.x2);
+        const y2 = Math.min(boxA.y2, boxB.y2);
+
+        const interWidth = Math.max(0, x2 - x1);
+        const interHeight = Math.max(0, y2 - y1);
+        const interArea = interWidth * interHeight;
+
+        const areaA = (boxA.x2 - boxA.x1) * (boxA.y2 - boxA.y1);
+        const areaB = (boxB.x2 - boxB.x1) * (boxB.y2 - boxB.y1);
+
+        return interArea / (areaA + areaB - interArea + 1e-6);
+      }
+
+      function nms(boxes, iouThreshold) {
+        boxes.sort((a, b) => b.score - a.score);
+        const selected = [];
+
+        for (const box of boxes) {
+          let keep = true;
+          for (const chosen of selected) {
+            if (box.cls === chosen.cls && iou(box, chosen) > iouThreshold) {
+              keep = false;
+              break;
+            }
+          }
+          if (keep) {
+            selected.push(box);
+          }
+        }
+        return selected;
+      }
+
+      function postprocessYOLO(data, shape, width, height) {
+        const confThreshold = parseFloat(confThreshInput.value) || 0.25;
+        const iouThreshold = parseFloat(iouThreshInput.value) || 0.45;
+
+        let numAttrs, numCandidates, isTransposed;
+
+        if (shape.length === 3) {
+          if (shape[1] < shape[2]) {
+            numAttrs = shape[1]; // e.g. 84 or 116
+            numCandidates = shape[2]; // e.g. 4725 or 8400
+            isTransposed = true;
+          } else {
+            numCandidates = shape[1];
+            numAttrs = shape[2];
+            isTransposed = false;
+          }
+        } else if (shape.length === 2) {
+          numAttrs = shape[0] < shape[1] ? shape[0] : shape[1];
+          numCandidates = shape[0] < shape[1] ? shape[1] : shape[0];
+          isTransposed = shape[0] < shape[1];
+        } else {
+          return [];
+        }
+
+        const numClasses = Math.min(80, numAttrs - 4);
+        const candidates = [];
+
+        for (let i = 0; i < numCandidates; i++) {
+          let cx, cy, w, h;
+          if (isTransposed) {
+            cx = data[0 * numCandidates + i];
+            cy = data[1 * numCandidates + i];
+            w = data[2 * numCandidates + i];
+            h = data[3 * numCandidates + i];
+          } else {
+            cx = data[i * numAttrs + 0];
+            cy = data[i * numAttrs + 1];
+            w = data[i * numAttrs + 2];
+            h = data[i * numAttrs + 3];
+          }
+
+          let maxScore = -Infinity;
+          let maxCls = -1;
+
+          for (let c = 0; c < numClasses; c++) {
+            const score = isTransposed ? data[(4 + c) * numCandidates + i] : data[i * numAttrs + (4 + c)];
+
+            if (score > maxScore) {
+              maxScore = score;
+              maxCls = c;
+            }
+          }
+
+          if (maxScore >= confThreshold) {
+            const x1 = Math.max(0, cx - w / 2);
+            const y1 = Math.max(0, cy - h / 2);
+            const x2 = Math.min(width, cx + w / 2);
+            const y2 = Math.min(height, cy + h / 2);
+
+            candidates.push({
+              x1,
+              y1,
+              x2,
+              y2,
+              score: maxScore,
+              cls: maxCls,
+              label: COCO_CLASSES[maxCls] || `cls_${maxCls}`,
+            });
+          }
+        }
+
+        return nms(candidates, iouThreshold);
+      }
+
+      function drawDetections(detections) {
+        ctx.lineWidth = 2;
+        ctx.font = "13px monospace";
+
+        detections.forEach((det) => {
+          const color = COLORS[det.cls % COLORS.length];
+          const boxWidth = det.x2 - det.x1;
+          const boxHeight = det.y2 - det.y1;
+
+          ctx.strokeStyle = color;
+          ctx.strokeRect(det.x1, det.y1, boxWidth, boxHeight);
+
+          const labelText = `${det.label} ${(det.score * 100).toFixed(0)}%`;
+          const textWidth = ctx.measureText(labelText).width;
+          const textHeight = 16;
+          const labelY = Math.max(textHeight, det.y1);
+
+          ctx.fillStyle = color;
+          ctx.fillRect(det.x1, labelY - textHeight, textWidth + 6, textHeight);
+
+          ctx.fillStyle = "#000000";
+          ctx.fillText(labelText, det.x1 + 3, labelY - 3);
+        });
+      }
+
       async function renderLoop() {
         if (!isRunning) return;
 
         if (video.readyState >= 2 && model) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const { width, height } = getInputDimensions();
+          ctx.drawImage(video, 0, 0, width, height);
+
           const inputTensor = preprocessFrame();
 
           try {
@@ -315,16 +595,12 @@
             if (outputs && outputs.length > 0) {
               const outTensor = outputs[0];
               const outData = await outTensor.data();
+              const shape = outTensor.shape || [1, 84, 8400];
 
-              ctx.strokeStyle = "#00FF00";
-              ctx.lineWidth = 2;
-              ctx.strokeRect(10, 10, canvas.width - 20, canvas.height - 20);
+              const detections = postprocessYOLO(outData, shape, width, height);
+              detCountEl.innerText = detections.length;
 
-              ctx.fillStyle = "#00FF00";
-              ctx.font = "14px monospace";
-              ctx.fillText(`Backend: ${backendBadge.innerText}`, 20, 35);
-              ctx.fillText(`Output Shape: [${outTensor.shape ? outTensor.shape.join(", ") : "Ready"}]`, 20, 55);
-              ctx.fillText(`Tracking / Output: ${outData.length > 0 ? "Active" : "Idle"}`, 20, 75);
+              drawDetections(detections);
 
               for (let i = 0; i < outputs.length; i++) {
                 outputs[i].delete();
@@ -348,7 +624,6 @@
         requestAnimationFrame(renderLoop);
       }
 
-      // Camera control handlers: requests permission only when user clicks "Start Camera"
       startBtn.addEventListener("click", async () => {
         statusEl.innerText = "Requesting camera permissions...";
         const { width: inputWidth, height: inputHeight } = getInputDimensions();
@@ -366,14 +641,13 @@
 
         try {
           if (stream) {
-            stream.getTracks().forEach((track) => track.stop());
+            stream.getTracks().forEach((t) => t.stop());
           }
 
           stream = await navigator.mediaDevices.getUserMedia(constraints);
           video.srcObject = stream;
           await video.play();
 
-          // Populate and update device labels now that permission has been granted
           const videoTrack = stream.getVideoTracks()[0];
           const activeDeviceId = videoTrack?.getSettings()?.deviceId || selectedDeviceId;
           await updateCameraList(activeDeviceId);
@@ -381,8 +655,7 @@
           isRunning = true;
           startBtn.disabled = true;
           stopBtn.disabled = false;
-          cameraSelect.disabled = false;
-          statusEl.innerText = "Inference and tracking active.";
+          statusEl.innerText = "Inference active.";
           requestAnimationFrame(renderLoop);
         } catch (err) {
           statusEl.innerText = `Camera access error: ${err.message}`;
@@ -390,25 +663,24 @@
         }
       });
 
-      // Handle switching camera from dropdown while running or ready
       cameraSelect.addEventListener("change", async () => {
         if (isRunning) {
-          startBtn.click(); // restart stream with selected deviceId
+          startBtn.click();
         }
       });
 
       stopBtn.addEventListener("click", () => {
         isRunning = false;
         if (stream) {
-          stream.getTracks().forEach((track) => track.stop());
+          stream.getTracks().forEach((t) => t.stop());
           stream = null;
         }
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        detCountEl.innerText = "0";
         statusEl.innerText = "Camera stopped.";
       });
 
-      // Boot Runtime
       initRuntime();
     </script>
   </body>
