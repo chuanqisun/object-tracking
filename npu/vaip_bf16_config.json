@@ -1,7 +1,0 @@
-{
-    "target": "X2",
-    "compiler": {
-        "opt_level": 3,
-        "precision": "BF16"
-    }
-}
