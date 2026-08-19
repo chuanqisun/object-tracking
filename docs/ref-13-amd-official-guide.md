@@ -254,6 +254,22 @@ The command should display the Ryzers build and run options.
 
 ## Step 2.2: Build and test the XDNA container
 
+> **Note on Ryzers Dockerfile fixes:**
+> If `ryzers build xdna` fails during XRT/XDNA compilation in `packages/npu/xdna/Dockerfile`, ensure the following fixes are applied in `packages/npu/xdna/Dockerfile`:
+>
+> 1. In the dependency installation step, install `jq` and invoke `xrtdeps.sh -docker` directly from the XRT submodule so all Boost libraries (`libboost-filesystem-dev`, `libboost-program-options-dev`) are installed:
+>    ```dockerfile
+>    RUN cd /ryzers/xdna-driver && \
+>        apt-get update && \
+>        apt-get install -y jq && \
+>        ./xrt/src/runtime_src/tools/scripts/xrtdeps.sh -docker
+>    ```
+> 2. Pass `-nokmod` to `./build.sh -release` to skip kernel module compilation inside the container (since host kernel headers are not available inside the container):
+>    ```dockerfile
+>    RUN cd /ryzers/xdna-driver/build && \
+>        ./build.sh -release -nokmod
+>    ```
+
 Build the base image:
 
 ```bash
