@@ -209,7 +209,7 @@ git clone --recursive https://github.com/uNetworking/uWebSockets.git
 sudo cp -r uWebSockets/src/* /usr/include/
 ```
 
-#### 5.2 Source Code: `server_uwebsockets_npu.cpp`
+#### 5.2 Source Code: `server_npu.cpp`
 
 This server features:
 
@@ -685,7 +685,7 @@ Create `build.sh`:
 set -e
 
 g++ -std=c++20 -O3 -march=native -flto \
-    server_uwebsockets_npu.cpp -o puck_eye_npu_server \
+    server_npu.cpp -o puck_eye_npu_server \
     -I/usr/include/uWebSockets \
     -I/usr/include/onnxruntime \
     $(pkg-config --cflags --libs libturbojpeg opencv4) \

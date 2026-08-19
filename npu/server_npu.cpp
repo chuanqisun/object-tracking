@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <unordered_set>
 #include <sched.h>
 #include <pthread.h>
 
@@ -68,16 +69,28 @@ public:
         mask_coeffs_buffer.resize(32);
         tj_instance = tjInitDecompress();
 
-        session_opts.SetIntraOpNumThreads(1);
+        session_opts.SetIntraOpNumThreads(4);
         session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
+        // Vitis-AI Execution Provider Options
         std::unordered_map<std::string, std::string> vitis_opts = {
             {"config_file", "vaip_bf16_config.json"},
-            {"cacheDir", "./npu_cache_bf16"}
+            {"cacheDir", "./npu_cache_bf16"},
+            {"cacheKey", "puck-eye-seg-s-bf16"}
         };
-        session_opts.AppendExecutionProvider("VitisAIExecutionProvider", vitis_opts);
-        session = std::make_unique<Ort::Session>(env, compiled_model_path.c_str(), session_opts);
-        std::cout << "[INFO] Native XDNA 2 BF16 Session Loaded Successfully." << std::endl;
+
+        std::cout << "[INFO] Requesting VitisAIExecutionProvider for native NPU execution..." << std::endl;
+        try {
+            session_opts.AppendExecutionProvider("VitisAIExecutionProvider", vitis_opts);
+            session = std::make_unique<Ort::Session>(env, compiled_model_path.c_str(), session_opts);
+            std::cout << "[INFO] Native XDNA 2 NPU Session Loaded Successfully." << std::endl;
+        } catch (const Ort::Exception& e) {
+            std::cerr << "[FATAL] Failed to initialize VitisAIExecutionProvider: " << e.what() << std::endl;
+            throw;
+        } catch (const std::exception& e) {
+            std::cerr << "[FATAL] Unexpected error initializing VitisAIExecutionProvider: " << e.what() << std::endl;
+            throw;
+        }
     }
 
     ~LowLatencyNPUWorker() {
@@ -227,6 +240,7 @@ std::mutex g_slot_mtx;
 std::condition_variable g_slot_cv;
 std::atomic<bool> g_running{true};
 uWS::Loop* g_loop = nullptr;
+std::unordered_set<void*> g_active_sockets;
 
 struct UserData {};
 
@@ -243,33 +257,40 @@ int main(int argc, char** argv) {
         CPU_SET(2, &cpuset);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-        LowLatencyNPUWorker worker(model_path);
-        std::vector<uint8_t> response_payload;
-        std::vector<uint8_t> local_frame(4 * 1024 * 1024);
+        try {
+            LowLatencyNPUWorker worker(model_path);
+            std::vector<uint8_t> response_payload;
+            std::vector<uint8_t> local_frame(4 * 1024 * 1024);
 
-        while (g_running) {
-            size_t frame_size = 0;
-            uWS::WebSocket<false, true, UserData>* target_ws = nullptr;
+            while (g_running) {
+                size_t frame_size = 0;
+                uWS::WebSocket<false, true, UserData>* target_ws = nullptr;
 
-            {
-                std::unique_lock<std::mutex> lock(g_slot_mtx);
-                g_slot_cv.wait(lock, [] { return g_frame_slot.ready.load() || !g_running; });
-                if (!g_running) break;
+                {
+                    std::unique_lock<std::mutex> lock(g_slot_mtx);
+                    g_slot_cv.wait(lock, [] { return g_frame_slot.ready.load() || !g_running; });
+                    if (!g_running) break;
 
-                frame_size = g_frame_slot.size;
-                target_ws = static_cast<uWS::WebSocket<false, true, UserData>*>(g_frame_slot.ws_ptr);
-                std::memcpy(local_frame.data(), g_frame_slot.buffer.data(), frame_size);
-                g_frame_slot.ready.store(false);
+                    frame_size = g_frame_slot.size;
+                    target_ws = static_cast<uWS::WebSocket<false, true, UserData>*>(g_frame_slot.ws_ptr);
+                    std::memcpy(local_frame.data(), g_frame_slot.buffer.data(), frame_size);
+                    g_frame_slot.ready.store(false);
+                }
+
+                float infer_time = 0.0f;
+                worker.process(local_frame.data(), frame_size, response_payload, infer_time);
+
+                if (target_ws && g_loop) {
+                    g_loop->defer([target_ws, payload = std::move(response_payload)]() {
+                        if (g_active_sockets.count(target_ws)) {
+                            target_ws->send(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()), uWS::OpCode::BINARY);
+                        }
+                    });
+                }
             }
-
-            float infer_time = 0.0f;
-            worker.process(local_frame.data(), frame_size, response_payload, infer_time);
-
-            if (target_ws && g_loop) {
-                g_loop->defer([target_ws, payload = std::move(response_payload)]() {
-                    target_ws->send(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()), uWS::OpCode::BINARY);
-                });
-            }
+        } catch (const std::exception& e) {
+            std::cerr << "[FATAL] Worker thread error: " << e.what() << std::endl;
+            g_running = false;
         }
     });
 
@@ -279,12 +300,15 @@ int main(int argc, char** argv) {
     CPU_SET(0, &net_cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &net_cpuset);
 
+    g_loop = uWS::Loop::get();
+
     uWS::App()
         .ws<UserData>("/*", {
             .compression = uWS::DISABLED,
             .maxPayloadLength = 16 * 1024 * 1024,
             .idleTimeout = 120,
-            .open = [](auto* /*ws*/) {
+            .open = [](auto* ws) {
+                g_active_sockets.insert(ws);
                 std::cout << "[uWS] Client Connected" << std::endl;
             },
             .message = [](auto* ws, std::string_view message, uWS::OpCode opCode) {
@@ -301,7 +325,14 @@ int main(int argc, char** argv) {
                 }
                 g_slot_cv.notify_one();
             },
-            .close = [](auto* /*ws*/, int, std::string_view) {
+            .close = [](auto* ws, int, std::string_view) {
+                g_active_sockets.erase(ws);
+                {
+                    std::lock_guard<std::mutex> lock(g_slot_mtx);
+                    if (g_frame_slot.ws_ptr == ws) {
+                        g_frame_slot.ws_ptr = nullptr;
+                    }
+                }
                 std::cout << "[uWS] Client Disconnected" << std::endl;
             }
         })
@@ -314,7 +345,6 @@ int main(int argc, char** argv) {
         })
         .run();
 
-    g_loop = uWS::Loop::get();
     g_running = false;
     g_slot_cv.notify_all();
     if (worker_thread.joinable()) worker_thread.join();
