@@ -277,11 +277,13 @@ cd ~/Ryzers
 ryzers build xdna
 ```
 
-Start the container:
+Start and enter the container interactively by passing `bash` as the command override:
 
 ```bash
-ryzers run --name xdna
+ryzers run --name ryzerdocker bash
 ```
+
+_(Note: Passing `bash` is required to stay inside an interactive shell. Running `ryzers run` without `bash` executes the container's default `test.sh` validation script and exits immediately.)_
 
 Inside the container:
 
@@ -309,9 +311,28 @@ For this NPU-only service, `/dev/accel/accel0` is the required device. GPU devic
 
 ## Step 2.3: Install the Ryzen AI SDK
 
-Obtain AMD’s current Linux Ryzen AI SDK archive and make it available inside the container.
+### 1. Download the SDK archive (Host)
 
-Extract and install it:
+AMD requires accepting an EULA before downloading the Ryzen AI Software package for Linux (`ryzen_ai-1.8.0.tgz`).
+
+- Visit AMD's download portal: [AMD Ryzen AI Software Installer EULA Page](https://account.amd.com/en/forms/downloads/ryzenai-eula-public-xef.html?filename=ryzen_ai-1.8.0.tgz)
+- Place `ryzen_ai-1.8.0.tgz` in your repository folder or downloads directory (e.g. `./ryzen_ai-1.8.0.tgz`).
+
+### 2. Copy the archive into the running container (Host)
+
+With your container running (via `ryzers run --name ryzerdocker bash`), copy the file from a host terminal into the container:
+
+```bash
+# Find your container ID or name:
+docker ps
+
+# Copy ryzen_ai-1.8.0.tgz into the container's /tmp directory:
+docker cp ./ryzen_ai-1.8.0.tgz <container_id_or_name>:/tmp/
+```
+
+### 3. Extract and install the SDK (Container)
+
+Inside the container terminal:
 
 ```bash
 mkdir -p /opt/ryzen-ai
@@ -335,11 +356,16 @@ source /opt/xilinx/xrt/setup.sh
 
 Install the application dependencies:
 
+> **Important on NumPy Version Compatibility:**
+> AMD Ryzen AI SDK 1.8.0 supplies a pre-compiled `onnxruntime` package built against NumPy 1.x ABI. Installing `ultralytics` or OpenCV without pinning will pull in NumPy 2.x, causing C++ binding import errors (`ImportError: import numpy failed`). Always pin `"numpy<2"` and `"opencv-python<4.11"` / `"opencv-python-headless<4.11"`.
+
 ```bash
 pip install \
+    "numpy<2" \
+    "opencv-python-headless<4.11" \
+    "opencv-python<4.11" \
     ultralytics \
     websockets \
-    opencv-python-headless \
     onnx
 ```
 

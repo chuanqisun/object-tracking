@@ -6,3 +6,5 @@ __pycache__
 *.onnx
 
 *_ncnn_model
+
+*.tgz
