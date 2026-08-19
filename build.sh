@@ -12,15 +12,18 @@ else
     exit 1
 fi
 
-echo "=========================================="
-echo " Building NCNN Vulkan C++ Inference Server"
-echo "=========================================="
+echo "=========================================================="
+echo " Building Optimized NCNN Vulkan Server (Zen 5 / RDNA 3.5) "
+echo "=========================================================="
 
 # 1. Setup PKG_CONFIG_PATH for NCNN
 NCNN_PATHS=(
     "/home/stack/repos/ncnn/build/install/lib64/pkgconfig"
+    "/home/stack/repos/ncnn/build/install/lib/pkgconfig"
     "$SCRIPT_DIR/../ncnn/build/install/lib64/pkgconfig"
+    "$SCRIPT_DIR/../ncnn/build/install/lib/pkgconfig"
     "$SCRIPT_DIR/ncnn/build/install/lib64/pkgconfig"
+    "$SCRIPT_DIR/ncnn/build/install/lib/pkgconfig"
 )
 
 for p in "${NCNN_PATHS[@]}"; do
@@ -51,18 +54,31 @@ if ! pkg-config --exists ncnn; then
     exit 1
 fi
 
+# Check for libturbojpeg optional acceleration
+EXTRA_LIBS=""
+if pkg-config --exists libturbojpeg; then
+    echo "--> Found libturbojpeg via pkg-config. TurboJPEG SIMD decoding enabled."
+    EXTRA_LIBS="$(pkg-config --cflags --libs libturbojpeg)"
+elif [ -f "/usr/include/turbojpeg.h" ] || [ -f "/usr/local/include/turbojpeg.h" ]; then
+    echo "--> Found libturbojpeg header. Linking -lturbojpeg."
+    EXTRA_LIBS="-lturbojpeg"
+else
+    echo "--> Notice: libturbojpeg header not found (using OpenCV imdecode fallback). Install turbojpeg-devel (Fedora) or libturbojpeg0-dev (Ubuntu/Debian) for maximum speed."
+fi
+
 # 4. Compile server.cpp
-echo "--> Compiling server.cpp into yolo_server..."
+echo "--> Compiling server.cpp into yolo_server with Zen 5 + AVX-512 optimizations..."
 cd "$INFERENCE_DIR"
 
-g++ -O3 -march=native -fopenmp \
+g++ -O3 -march=native -flto -fopenmp \
     server.cpp -o yolo_server \
     $(pkg-config --cflags --libs opencv4 ncnn) \
+    $EXTRA_LIBS \
     -L/home/stack/repos/ncnn/build/install/lib64 \
     -lglslang -lMachineIndependent -lGenericCodeGen -lOSDependent -lSPIRV \
     -lvulkan -lpthread
 
-echo "------------------------------------------"
+echo "----------------------------------------------------------"
 echo " Build successful!"
 echo " Executable created at: $INFERENCE_DIR/yolo_server"
-echo "------------------------------------------"
+echo "----------------------------------------------------------"
