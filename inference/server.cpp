@@ -2,6 +2,8 @@
 #include <vector>
 #include <memory>
 #include <queue>
+#include <deque>
+#include <iomanip>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -18,6 +20,86 @@
 
 // Micro HTTP Server using Crow (Header-only: github.com/CrowCpp/Crow)
 #include "crow_all.h"
+
+struct FrameTiming {
+    double decode_ms = 0.0;
+    double preprocess_ms = 0.0;
+    double extract_out0_ms = 0.0;
+    double extract_out1_ms = 0.0;
+    double postprocess_ms = 0.0;
+    double json_ms = 0.0;
+    double total_ms = 0.0;
+};
+
+struct PerfRecord {
+    std::chrono::high_resolution_clock::time_point time;
+    FrameTiming timing;
+};
+
+class SlidingWindowPerfTracker {
+private:
+    std::deque<PerfRecord> window;
+    std::chrono::high_resolution_clock::time_point last_log_time;
+    bool has_logged = false;
+
+public:
+    void add_sample(const FrameTiming& ft) {
+        auto now = std::chrono::high_resolution_clock::now();
+        window.push_back({now, ft});
+
+        // Retain samples within the 1-second sliding window
+        while (!window.empty() &&
+               std::chrono::duration_cast<std::chrono::milliseconds>(now - window.front().time).count() > 1000) {
+            window.pop_front();
+        }
+
+        // Output average stats to console every 1 second (or on the first frame)
+        if (!has_logged || std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 1000) {
+            log_stats(now);
+            last_log_time = now;
+            has_logged = true;
+        }
+    }
+
+private:
+    void log_stats(const std::chrono::high_resolution_clock::time_point& now) {
+        if (window.empty()) return;
+
+        size_t n = window.size();
+        double sum_decode = 0, sum_prep = 0, sum_out0 = 0, sum_out1 = 0, sum_post = 0, sum_json = 0, sum_total = 0;
+
+        for (const auto& rec : window) {
+            sum_decode += rec.timing.decode_ms;
+            sum_prep += rec.timing.preprocess_ms;
+            sum_out0 += rec.timing.extract_out0_ms;
+            sum_out1 += rec.timing.extract_out1_ms;
+            sum_post += rec.timing.postprocess_ms;
+            sum_json += rec.timing.json_ms;
+            sum_total += rec.timing.total_ms;
+        }
+
+        double fps = static_cast<double>(n);
+        if (n > 1) {
+            double window_sec = std::chrono::duration<double>(now - window.front().time).count();
+            if (window_sec > 0.001) {
+                fps = static_cast<double>(n - 1) / window_sec;
+            }
+        } else {
+            fps = 1000.0 / std::max(sum_total, 0.001);
+        }
+
+        std::cout << "[Perf 1s Avg] FPS: " << std::fixed << std::setprecision(1) << fps
+                  << " (" << n << " frames) | "
+                  << "Total: " << std::setprecision(2) << (sum_total / n) << "ms [ "
+                  << "Decode: " << (sum_decode / n) << "ms | "
+                  << "Prep: " << (sum_prep / n) << "ms | "
+                  << "Out0: " << (sum_out0 / n) << "ms | "
+                  << "Out1: " << (sum_out1 / n) << "ms | "
+                  << "Post: " << (sum_post / n) << "ms | "
+                  << "JSON: " << (sum_json / n) << "ms ]"
+                  << std::endl;
+    }
+};
 
 struct DetectionProposal {
     int class_id;
@@ -66,13 +148,17 @@ public:
 #endif
     }
 
-    crow::json::wvalue infer(const unsigned char* data, size_t size) {
-        auto start_time = std::chrono::high_resolution_clock::now();
+    crow::json::wvalue infer(const unsigned char* data, size_t size, FrameTiming& ft) {
+        auto t_start = std::chrono::high_resolution_clock::now();
         int img_w = 0;
         int img_h = 0;
         ncnn::Mat in;
 
         bool decoded = false;
+
+        auto t_decode_start = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point t_decode_end;
+        std::chrono::high_resolution_clock::time_point t_prep_start;
 
 #if HAS_TURBOJPEG
         if (tj_instance && size > 4 && data[0] == 0xFF && data[1] == 0xD8) {
@@ -81,6 +167,8 @@ public:
                 std::vector<uint8_t> rgb_buffer(img_w * img_h * 3);
                 if (tjDecompress2(tj_instance, data, size, rgb_buffer.data(),
                                   img_w, 0, img_h, TJPF_RGB, TJFLAG_FASTDCT) == 0) {
+                    t_decode_end = std::chrono::high_resolution_clock::now();
+                    t_prep_start = t_decode_end;
                     in = ncnn::Mat::from_pixels_resize(rgb_buffer.data(),
                         ncnn::Mat::PIXEL_RGB, img_w, img_h, target_size, target_size);
                     decoded = true;
@@ -95,6 +183,8 @@ public:
             if (img.empty()) return {{"error", "Invalid image format"}};
             img_w = img.cols;
             img_h = img.rows;
+            t_decode_end = std::chrono::high_resolution_clock::now();
+            t_prep_start = t_decode_end;
             in = ncnn::Mat::from_pixels_resize(img.data,
                 ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h, target_size, target_size);
         }
@@ -103,12 +193,19 @@ public:
 
         ncnn::Extractor ex = net.create_extractor();
         ex.input("in0", in);
+        auto t_prep_end = std::chrono::high_resolution_clock::now();
 
+        auto t_out0_start = t_prep_end;
         ncnn::Mat out_det;
-        ncnn::Mat out_proto;
         ex.extract("out0", out_det);
-        ex.extract("out1", out_proto);
+        auto t_out0_end = std::chrono::high_resolution_clock::now();
 
+        auto t_out1_start = t_out0_end;
+        ncnn::Mat out_proto;
+        ex.extract("out1", out_proto);
+        auto t_out1_end = std::chrono::high_resolution_clock::now();
+
+        auto t_post_start = t_out1_end;
         crow::json::wvalue res;
         std::vector<crow::json::wvalue> detections;
         std::vector<DetectionProposal> proposals;
@@ -207,14 +304,37 @@ public:
             detections.push_back(std::move(obj));
         }
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        double infer_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        auto t_post_end = std::chrono::high_resolution_clock::now();
+
+        auto t_json_start = t_post_end;
+
+        ft.decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+        ft.preprocess_ms = std::chrono::duration<double, std::milli>(t_prep_end - t_prep_start).count();
+        ft.extract_out0_ms = std::chrono::duration<double, std::milli>(t_out0_end - t_out0_start).count();
+        ft.extract_out1_ms = std::chrono::duration<double, std::milli>(t_out1_end - t_out1_start).count();
+        ft.postprocess_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
 
         res["img_w"] = img_w;
         res["img_h"] = img_h;
         res["target_size"] = target_size;
-        res["infer_ms"] = infer_ms;
         res["detections"] = std::move(detections);
+
+        auto t_json_end = std::chrono::high_resolution_clock::now();
+        ft.json_ms = std::chrono::duration<double, std::milli>(t_json_end - t_json_start).count();
+        ft.total_ms = std::chrono::duration<double, std::milli>(t_json_end - t_start).count();
+
+        res["infer_ms"] = ft.total_ms;
+
+        crow::json::wvalue timing_json;
+        timing_json["decode_ms"] = ft.decode_ms;
+        timing_json["preprocess_ms"] = ft.preprocess_ms;
+        timing_json["extract_out0_ms"] = ft.extract_out0_ms;
+        timing_json["extract_out1_ms"] = ft.extract_out1_ms;
+        timing_json["postprocess_ms"] = ft.postprocess_ms;
+        timing_json["json_ms"] = ft.json_ms;
+        timing_json["total_ms"] = ft.total_ms;
+        res["timing"] = std::move(timing_json);
+
         return res;
     }
 };
@@ -223,6 +343,7 @@ public:
 class YOLO26SegEngine {
 private:
     std::unique_ptr<YOLO26SegWorker> worker;
+    SlidingWindowPerfTracker perf_tracker;
     std::mutex mtx;
 
 public:
@@ -238,7 +359,10 @@ public:
 
     crow::json::wvalue infer(const unsigned char* data, size_t len) {
         std::lock_guard<std::mutex> lock(mtx);
-        return worker->infer(data, len);
+        FrameTiming ft;
+        auto res = worker->infer(data, len, ft);
+        perf_tracker.add_sample(ft);
+        return res;
     }
 };
 
