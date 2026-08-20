@@ -1,0 +1,12 @@
+.git
+.gitignore
+venv
+__pycache__
+*.onnx
+*.engine
+*.tflite
+puck-eye-seg-s_ncnn_model
+docs
+web
+app
+inference
