@@ -113,41 +113,47 @@ Confirm `/dev/accel/accel0` exists and `ulimit -l` reports `unlimited`.
 # Phase 2: Build the Turn-Key Docker Container
 
 All required build assets must be placed inside `docker-data/`:
+
 - `docker-data/ryzen_ai-1.8.0.tgz` (AMD Ryzen AI SDK archive)
 - `docker-data/yolo26s-seg.pt` (PyTorch model weights)
 - `docker-data/sample.jpg` (Sample test image)
 
 ## Step 2.1: Review the Dockerfile (`npu/Dockerfile`)
 
-The container builds on top of `ryzerdocker:latest` and bakes all dependencies, models, and scripts into the image:
+The container builds on top of `ryzerdocker:latest` and bakes all dependencies, models, and scripts into the image using Docker BuildKit bind mounts to avoid copying multi-gigabyte tar archives into image layers:
 
 ```dockerfile
+# syntax=docker/dockerfile:1
 FROM ryzerdocker:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV LD_PRELOAD=/opt/xilinx/xrt/lib/libxrt_coreutil.so.2
 WORKDIR /workspace
 
-# Copy Ryzen AI SDK archive and model assets from docker-data at build time
-COPY docker-data/ryzen_ai-1.8.0.tgz /tmp/
+# Copy model assets
 COPY docker-data/yolo26s-seg.pt /workspace/yolo26s-seg.pt
 COPY docker-data/sample.jpg /workspace/sample.jpg
 
-# Install AMD Ryzen AI SDK inside the image
-RUN mkdir -p /opt/ryzen-ai && \
-    tar -xzf /tmp/ryzen_ai-1.8.0.tgz -C /opt/ryzen-ai && \
-    rm -f /tmp/ryzen_ai-1.8.0.tgz && \
-    cd /opt/ryzen-ai && \
-    ./install_ryzen_ai.sh -a yes -p /opt/ryzen-ai/venv
-
-# Activate venv and install required Python packages
-RUN . /opt/ryzen-ai/venv/bin/activate && \
+# Extract and install AMD Ryzen AI SDK, Python dependencies, and onnxruntime_vitisai wheel using direct bind mount
+RUN --mount=type=bind,source=docker-data/ryzen_ai-1.8.0.tgz,target=/tmp/ryzen_ai-1.8.0.tgz \
+    mkdir -p /tmp/ryzen-ai /opt/ryzen-ai && \
+    tar -xzf /tmp/ryzen_ai-1.8.0.tgz -C /tmp/ryzen-ai && \
+    cp /tmp/ryzen-ai/onnxruntime_vitisai-1.27.0-py3-none-linux_x86_64.whl /tmp/ && \
+    cd /tmp/ryzen-ai && \
+    ./install_ryzen_ai.sh -a yes -p /opt/ryzen-ai/venv && \
+    rm -rf /tmp/ryzen-ai && \
+    . /opt/ryzen-ai/venv/bin/activate && \
     pip install --no-cache-dir \
         "numpy<2" \
         "opencv-python-headless<4.11" \
         "opencv-python<4.11" \
         ultralytics \
         websockets \
-        onnx
+        onnx \
+        onnxslim && \
+    pip uninstall -y onnxruntime onnxruntime-vitisai && \
+    pip install --no-deps /tmp/onnxruntime_vitisai-1.27.0-py3-none-linux_x86_64.whl && \
+    rm -f /tmp/onnxruntime_vitisai-1.27.0-py3-none-linux_x86_64.whl
 
 # Copy server application files
 COPY npu/vaiml_config.json /workspace/vaiml_config.json
@@ -157,10 +163,11 @@ COPY npu/entrypoint.sh /workspace/entrypoint.sh
 
 RUN chmod +x /workspace/entrypoint.sh
 
-# Bake static FP32 ONNX model during build time
+# Bake static FP32 ONNX and QDQ INT8 models during build time
 RUN . /opt/ryzen-ai/venv/bin/activate && \
     export PT_MODEL_PATH=/workspace/yolo26s-seg.pt && \
     export ONNX_MODEL_PATH=/workspace/yolo26s-seg.onnx && \
+    export QDQ_MODEL_PATH=/workspace/yolo26s-seg_qdq.onnx && \
     python /workspace/export_model.py
 
 EXPOSE 8765
@@ -170,10 +177,25 @@ ENTRYPOINT ["/workspace/entrypoint.sh"]
 
 ## Step 2.2: Build the Container Image
 
-Run the build command from the workspace root:
+Run the build command with BuildKit enabled from the workspace root:
 
 ```bash
-docker build -t yolo26-npu:latest -f npu/Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t yolo26-npu:latest -f npu/Dockerfile .
+
+# Fast build
+DOCKER_BUILDKIT=1 docker buildx build \
+  --progress=plain \
+  --output type=docker,compression=zstd \
+  -t yolo26-npu:latest \
+  -f npu/Dockerfile .
+
+
+# Uncompressed build
+DOCKER_BUILDKIT=1 docker buildx build \
+  --progress=plain \
+  --output type=docker,compression=uncompressed \
+  -t yolo26-npu:latest \
+  -f npu/Dockerfile .
 ```
 
 ---
@@ -191,6 +213,9 @@ docker run -d \
   --ulimit memlock=-1:-1 \
   -p 8765:8765 \
   yolo26-npu:latest
+
+
+
 ```
 
 Check the server logs to verify startup:
@@ -200,6 +225,7 @@ docker logs -f yolo26-npu-server
 ```
 
 Expected startup logs:
+
 ```text
 ==================================================
  Starting Turn-Key YOLO26 NPU Inference Server
@@ -224,6 +250,7 @@ python npu/test_client.py
 ```
 
 Expected output:
+
 ```text
 Connecting to WebSocket server at ws://localhost:8765...
 Connected! Sending requests...
@@ -253,19 +280,21 @@ The device report should show `RyzenAI-npu4` (`aie2p` architecture) present and 
 # Deployment Acceptance Checklist
 
 ## Host
+
 - [x] AMD NPU appears in `lspci`.
 - [x] `/dev/accel/accel0` exists and user is in `render`/`video` groups.
 - [x] `amdxdna` kernel module is loaded.
 - [x] Host `ulimit -l` reports `unlimited`.
 
 ## Container Image
+
 - [x] Container image `yolo26-npu:latest` builds cleanly from `npu/Dockerfile`.
 - [x] All assets (`ryzen_ai-1.8.0.tgz`, `yolo26s-seg.pt`, scripts) are copied from `docker-data/` at build time.
 - [x] Static ONNX model (`yolo26s-seg.onnx`) is exported automatically at build time.
 
 ## Service Runtime
+
 - [x] Container runs turn-key style via `docker run -d --device /dev/accel/accel0 --ulimit memlock=-1:-1 -p 8765:8765 yolo26-npu:latest`.
 - [x] WebSocket server listens on `ws://0.0.0.0:8765`.
 - [x] `VitisAIExecutionProvider` initializes successfully with NPU device access.
 - [x] Host client receives valid detection bounding boxes, confidence scores, and segmentation contours.
-
