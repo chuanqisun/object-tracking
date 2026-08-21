@@ -1,3 +1,5 @@
+See [AMD Ryzen AI Pro 9 HX 370 specific version](https://github.com/chuanqisun/object-tracking-gpu)
+
 # YOLO26 Real-Time Object Detection
 
 ## Installation
